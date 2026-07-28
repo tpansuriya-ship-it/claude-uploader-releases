@@ -786,6 +786,82 @@ function adminQueuePing(name) {
   }
 }
 
+// v2.0.7: the Drive upload folder the fleet should write to.
+//
+// Empty (the default) means "use the folder compiled into the binary", which is
+// the safe state: it cannot break anything. Setting it makes every v2.0.7+ agent
+// switch on its next poll — within 60 seconds, no rebuild, no desk visits.
+// Pre-v2.0.7 agents simply ignore the extra field.
+var UPLOAD_FOLDER_SETTING_KEY = 'uploadDriveFolderId';
+
+function getUploadDriveFolderIdCached_() {
+  // Same 10-minute settings cache as uploadFrequency — this is read on every
+  // poll by every agent, so it must never hit the spreadsheet in the hot path.
+  return getSettingCached_(UPLOAD_FOLDER_SETTING_KEY, '');
+}
+
+// Point the fleet at a different Drive folder. Validates before saving, because
+// a bad value here propagates to every machine within a minute.
+function setUploadDriveFolderId(folderId) {
+  requireAdmin_();
+  var id = String(folderId == null ? '' : folderId).trim();
+
+  // Accept a pasted Drive URL as well as a bare ID — the URL is what an admin
+  // actually has in their clipboard, and silently mis-saving it would break uploads.
+  var m = id.match(/\/folders\/([A-Za-z0-9_-]{10,80})/);
+  if (m) id = m[1];
+
+  if (id && !/^[A-Za-z0-9_-]{10,80}$/.test(id)) {
+    return { success: false, error: 'That does not look like a Drive folder ID or URL: ' + folderId };
+  }
+
+  // Empty = revert the fleet to the compiled default. Always allowed.
+  if (id) {
+    // Confirm the folder at least EXISTS and this script can see it. Note the
+    // caveat below: this proves nothing about the service account the agents use.
+    try {
+      var f = DriveApp.getFolderById(id);
+      var probeName = f.getName();
+    } catch (e) {
+      return {
+        success: false,
+        error: 'Cannot open that folder as this script: ' + e.toString(),
+        hint: 'Check the ID, and make sure the folder is shared with the Apps Script owner account.'
+      };
+    }
+  }
+
+  var sheet = ensureSettingsSheet_();
+  setSettingValue_(sheet, UPLOAD_FOLDER_SETTING_KEY, id);
+  invalidateCache_();
+  log_('Fleet upload folder set to: ' + (id || '(compiled default)'));
+
+  return {
+    success: true,
+    folderId: id,
+    usingCompiledDefault: !id,
+    folderName: id ? probeName : null,
+    rolloutNote: 'Every v2.0.7+ agent switches on its next poll (<=60s). Agents on ' +
+                 'v2.0.6 or earlier ignore this and keep using their compiled folder ' +
+                 'until they self-update.',
+    criticalCaveat: 'The AGENTS authenticate as the SERVICE ACCOUNT (' +
+                    'see service-account-key.json), NOT as this script. This check only ' +
+                    'proved the script can see the folder. Grant the service account ' +
+                    'Editor on it too, or every upload will 404 and fall back to the old folder.'
+  };
+}
+
+function getUploadDriveFolderInfo() {
+  requireAdmin_();
+  var id = getSetting_(UPLOAD_FOLDER_SETTING_KEY, '');
+  var out = { folderId: id, usingCompiledDefault: !id, compiledDefault: SHARED_DRIVE_FOLDER_ID };
+  if (id) {
+    try { out.folderName = DriveApp.getFolderById(id).getName(); }
+    catch (e) { out.folderName = null; out.warning = 'Script cannot open this folder: ' + e.toString(); }
+  }
+  return out;
+}
+
 function checkAndClearTrigger(name) {
   if (!name) return { triggered: false, paused: false };
 
@@ -794,6 +870,7 @@ function checkAndClearTrigger(name) {
   var pausedSet       = getPausedSetCached_();
   var uploadFrequency = getSettingCached_('uploadFrequency', 'weekly');
   var uploadSchedule  = getUploadScheduleCached_();
+  var driveFolderId   = getUploadDriveFolderIdCached_();
   var paused          = !!pausedSet[name.trim().toLowerCase()];
 
   // Trigger-queue check — served from a 15-second cache.
@@ -811,7 +888,7 @@ function checkAndClearTrigger(name) {
     }
   }
   if (!candidateFound) {
-    return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule };
+    return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
   }
 
   // --- SAFE PATH (exclusive lock) ---
@@ -819,12 +896,12 @@ function checkAndClearTrigger(name) {
   // mutating so concurrent requests cannot double-consume the same trigger entry.
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var qSheet = ss.getSheetByName('TriggerQueue');
-  if (!qSheet) return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule };
+  if (!qSheet) return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
 
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) {
     log_('checkAndClearTrigger: lock timeout for ' + name);
-    return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule };
+    return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
   }
   try {
     var data = qSheet.getDataRange().getValues();
@@ -838,11 +915,11 @@ function checkAndClearTrigger(name) {
         SpreadsheetApp.flush();  // commit immediately so concurrent readers see it gone
         log_('TriggerQueue: consumed ' + triggerType + ' for ' + name);
         invalidateCache_();
-        return { triggered: true, type: triggerType, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule };
+        return { triggered: true, type: triggerType, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
       }
     }
     // Trigger was claimed by a concurrent request between the cache-check and lock acquisition.
-    return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule };
+    return { triggered: false, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
   } finally {
     lock.releaseLock();
   }
@@ -2924,6 +3001,262 @@ function cleanupPausedDevelopersFiles() {
   }
 }
 
+// ================================================================
+// v5.2 — WEEKLY REPORT ARCHIVE
+// ================================================================
+// Requirement: "Reports should be uploaded to folders using the format
+// Month-Date Range-Year (e.g. July 20-26 2026)" and "reports for removed users
+// should remain available for 120 days".
+//
+// The uploader overwrites ONE flat file per developer per report type, in place,
+// via a PATCH. That means there is no history at all — only ever the latest
+// state. Changing that in the client would need a new binary on every machine.
+//
+// This does it server-side instead: once a week, COPY the flat files into a
+// dated folder. The agents are untouched, the flat files keep working exactly as
+// they do now, and the dated folders accumulate the immutable weekly history
+// that date-range search and retention actually need.
+//
+// The snapshot re-runs daily against the last completed week for a grace period,
+// because a machine that boots on Wednesday still uploads that week's report —
+// a single Monday-morning pass would silently miss every late reporter.
+var WEEKLY_ARCHIVE_PARENT_ID = '1ss0gkNQPjFRoqRLp2zmGV7SEUp5tbzVu';
+
+// How long after a week closes we keep refreshing its folder with late arrivals.
+// After this the folder is left alone and treated as final.
+var ARCHIVE_GRACE_DAYS = 10;
+
+// Stop before Apps Script's 6-minute ceiling and let the next daily run resume.
+var ARCHIVE_TIME_BUDGET_MS = 4 * 60 * 1000;
+
+// Verify the script can actually write to the archive parent BEFORE anything
+// depends on it. Drive failures here are silent and easy to miss otherwise.
+function checkWeeklyArchiveAccess() {
+  requireAdmin_();
+  var out = { parentFolderId: WEEKLY_ARCHIVE_PARENT_ID };
+  try {
+    var parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+    out.parentFolderName = parent.getName();
+    out.canRead = true;
+  } catch (e) {
+    return {
+      parentFolderId: WEEKLY_ARCHIVE_PARENT_ID,
+      canRead: false,
+      canWrite: false,
+      error: e.toString(),
+      fix: 'Share the archive folder with the account that OWNS this Apps Script ' +
+           'project (Deploy > Manage deployments shows "Execute as"), with Editor access.'
+    };
+  }
+  // Write test: create then immediately trash a probe folder.
+  try {
+    var probe = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID)
+      .createFolder('__write_probe_' + Utilities.formatDate(new Date(), 'UTC', 'yyyyMMdd_HHmmss'));
+    probe.setTrashed(true);
+    out.canWrite = true;
+    out.verdict = 'READY. The script can create dated folders in "' + out.parentFolderName + '".';
+  } catch (e) {
+    out.canWrite = false;
+    out.error = e.toString();
+    out.verdict = 'READ-ONLY. The script can see the folder but not write to it — snapshots would fail.';
+    out.fix = 'Give the Apps Script owner account Editor (not Viewer) on this folder.';
+  }
+  return out;
+}
+
+// Copy the current flat report files into the dated folder for one week.
+// Idempotent: a file already present and not older than the source is skipped.
+function snapshotWeeklyReports(weekStartIso, weekEndIso) {
+  var win = (weekStartIso && weekEndIso)
+    ? { weekStart: weekStartIso, weekEnd: weekEndIso, label: formatWeekLabel_(weekStartIso, weekEndIso) }
+    : lastCompletedWeekWindow_();
+
+  var started = Date.now();
+  var report = {
+    period: win, folderName: win.label,
+    copied: [], refreshed: [], skipped: [], failed: [],
+    timedOut: false
+  };
+
+  var parent, source;
+  try {
+    parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+    source = DriveApp.getFolderById(SHARED_DRIVE_FOLDER_ID);
+  } catch (e) {
+    report.error = 'Cannot open a required folder: ' + e.toString();
+    log_('WeeklyArchive: ' + report.error);
+    return report;
+  }
+
+  // Find-or-create the dated folder. getFoldersByName is exact-match, which is
+  // what we want — two folders with the same label would split a week's history.
+  var target = null;
+  var it = parent.getFoldersByName(win.label);
+  if (it.hasNext()) {
+    target = it.next();
+    report.folderExisted = true;
+  } else {
+    target = parent.createFolder(win.label);
+    report.folderExisted = false;
+    log_('WeeklyArchive: created folder "' + win.label + '"');
+  }
+  report.folderId = target.getId();
+
+  // Index what is already archived so re-runs are cheap and late arrivals win.
+  var existing = {};
+  var exIt = target.getFiles();
+  while (exIt.hasNext()) {
+    var ex = exIt.next();
+    if (ex.isTrashed()) continue;
+    existing[ex.getName()] = { file: ex, updated: ex.getLastUpdated().getTime() };
+  }
+
+  var files = source.getFiles();
+  while (files.hasNext()) {
+    if (Date.now() - started > ARCHIVE_TIME_BUDGET_MS) {
+      report.timedOut = true;
+      log_('WeeklyArchive: hit the time budget — the next daily run resumes where this stopped');
+      break;
+    }
+    var f = files.next();
+    if (f.isTrashed()) continue;
+    var fn = f.getName();
+    if (!/_claude_(daily|session)\.json$/i.test(fn)) continue;
+
+    var srcUpdated = f.getLastUpdated().getTime();
+    var prior = existing[fn];
+
+    if (prior) {
+      // Only replace when the live file is genuinely newer — a late reporter.
+      if (srcUpdated <= prior.updated + 1000) { report.skipped.push(fn); continue; }
+      try {
+        prior.file.setTrashed(true);
+        f.makeCopy(fn, target);
+        report.refreshed.push(fn);
+      } catch (e) {
+        report.failed.push({ file: fn, error: e.toString() });
+      }
+      continue;
+    }
+
+    try {
+      f.makeCopy(fn, target);
+      report.copied.push(fn);
+    } catch (e) {
+      report.failed.push({ file: fn, error: e.toString() });
+    }
+  }
+
+  report.summary = {
+    newlyCopied: report.copied.length,
+    refreshedFromLateUploads: report.refreshed.length,
+    alreadyCurrent: report.skipped.length,
+    failures: report.failed.length
+  };
+  log_('WeeklyArchive "' + win.label + '": ' + report.summary.newlyCopied + ' copied, ' +
+       report.summary.refreshedFromLateUploads + ' refreshed, ' +
+       report.summary.alreadyCurrent + ' unchanged, ' + report.summary.failures + ' failed');
+  return report;
+}
+
+// Daily trigger entry. Snapshots the last completed week, and keeps refreshing
+// it for ARCHIVE_GRACE_DAYS so machines that boot mid-week are still captured.
+// Public (no requireAdmin_) so the scheduler can run it with no user session.
+function runWeeklyArchiveSnapshot() {
+  var win = lastCompletedWeekWindow_();
+  var endMs = new Date(win.weekEnd + 'T23:59:59Z').getTime();
+  var daysSinceClose = (Date.now() - endMs) / 86400000;
+
+  if (daysSinceClose > ARCHIVE_GRACE_DAYS) {
+    // Week is final. Nothing to add, and re-copying would churn Drive daily.
+    return { skipped: true, reason: 'week "' + win.label + '" closed ' +
+             Math.round(daysSinceClose) + ' days ago, past the ' + ARCHIVE_GRACE_DAYS +
+             '-day grace window', period: win };
+  }
+  return snapshotWeeklyReports(win.weekStart, win.weekEnd);
+}
+
+function isWeeklyArchiveTriggerInstalled() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'runWeeklyArchiveSnapshot') return true;
+  }
+  return false;
+}
+
+function ensureWeeklyArchiveTrigger_() {
+  if (isWeeklyArchiveTriggerInstalled()) return false;
+  // Daily at 02:00 script-tz — after the Monday 00:00 generation window opens,
+  // and it re-runs every day so late uploads still land in the right week.
+  ScriptApp.newTrigger('runWeeklyArchiveSnapshot')
+    .timeBased().everyDays(1).atHour(2).create();
+  log_('WeeklyArchive: daily snapshot trigger installed (02:00 ' +
+       (Session.getScriptTimeZone() || 'Asia/Kolkata') + ')');
+  return true;
+}
+
+function installWeeklyArchiveTrigger() {
+  requireAdmin_();
+  var created = ensureWeeklyArchiveTrigger_();
+  return { success: true, created: created,
+           message: created ? 'Daily archive trigger installed' : 'Already installed' };
+}
+
+function uninstallWeeklyArchiveTrigger() {
+  requireAdmin_();
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'runWeeklyArchiveSnapshot') {
+      ScriptApp.deleteTrigger(triggers[i]); removed++;
+    }
+  }
+  return { success: true, removed: removed };
+}
+
+// List what has actually been archived, newest week first. This is the index
+// that a date-range report search reads.
+function listArchivedWeeks() {
+  requireAdmin_();
+  var out = [];
+  try {
+    var parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+    var it = parent.getFolders();
+    while (it.hasNext()) {
+      var f = it.next();
+      if (f.isTrashed()) continue;
+      if (/^__write_probe_/.test(f.getName())) continue;
+      var count = 0;
+      var fi = f.getFiles();
+      while (fi.hasNext()) { if (!fi.next().isTrashed()) count++; }
+      out.push({
+        folderName: f.getName(),
+        folderId: f.getId(),
+        fileCount: count,
+        developerCount: Math.floor(count / 2), // daily + session per developer
+        createdIso: f.getDateCreated().toISOString(),
+        url: f.getUrl()
+      });
+    }
+  } catch (e) {
+    return { error: e.toString(), parentFolderId: WEEKLY_ARCHIVE_PARENT_ID };
+  }
+  out.sort(function(a, b) { return b.createdIso.localeCompare(a.createdIso); });
+  return { parentFolderId: WEEKLY_ARCHIVE_PARENT_ID, weeks: out, weekCount: out.length };
+}
+
+function logArchiveAccessCheck() {
+  Logger.log(JSON.stringify(checkWeeklyArchiveAccess(), null, 2));
+}
+
+function logArchiveSnapshotNow() {
+  Logger.log(JSON.stringify(runWeeklyArchiveSnapshot(), null, 2));
+}
+
+function logArchivedWeeks() {
+  Logger.log(JSON.stringify(listArchivedWeeks(), null, 2));
+}
+
 // -------------------- PAUSE / RESUME --------------------
 
 function isDeveloperPaused_(ss, name) {
@@ -3319,14 +3652,25 @@ var DEFAULT_EMAIL_TEMPLATES = {
     subject: 'Action required: install the Claude Usage Uploader',
     body: 'Hi {{firstName}},\n\n' +
       'You have been enrolled in Claude Code usage reporting. Please install the ' +
-      'Claude Usage Uploader utility on your {{system}} machine.\n\n' +
+      'Claude Usage Uploader on your {{system}} machine. It takes about two minutes.\n\n' +
       'Download (v{{latestVersion}}):\n{{downloadUrl}}\n\n' +
-      'Setup takes about a minute:\n' +
-      '  1. Download and run the installer.\n' +
-      '  2. Enter your first and last name exactly as "{{name}}" when prompted.\n' +
-      '  3. Leave it running — it reports automatically in the background.\n\n' +
-      'If the installer reports that it could not register the scheduled task, ' +
-      'right-click it and choose "Run as Administrator".\n\n' +
+      'Steps:\n' +
+      '  1. Download the ZIP and RIGHT-CLICK it > Extract All.\n' +
+      '     (Do not run anything from inside the ZIP without extracting first.)\n' +
+      '  2. In the extracted folder, right-click "Repair-Claude-Uploader.cmd"\n' +
+      '     and choose "Run as administrator". Click Yes when Windows asks.\n' +
+      '  3. A page opens in your browser. Enter your name exactly as\n' +
+      '     "{{name}}" and click Save.\n\n' +
+      'That is all. The tool then runs silently in the background and starts itself\n' +
+      'at every login. There is no icon and no window — that is normal.\n\n' +
+      'Two things to be aware of:\n' +
+      '  - Run it from your own Windows login. The background task is registered\n' +
+      '    for whoever runs it, so it will not work if someone else runs it for you.\n' +
+      '  - Keep the extracted files together in one folder. The tool will not start\n' +
+      '    if any of them are moved or deleted.\n\n' +
+      'If anything goes wrong, open "install guide.txt" in the same folder, or reply\n' +
+      'to this email and attach the file %TEMP%\\claude-uploader.log\n' +
+      '(paste %TEMP% into the File Explorer address bar to find it).\n\n' +
       'Thanks,\nSigma Solve Engineering'
   },
   update: {
@@ -3868,21 +4212,29 @@ function uninstallWeeklyDigestTrigger() {
 // setupUtilityDistribution until the Gist says 2.0.6, or the dashboard will flag
 // the whole fleet as outdated and the mass-reminder will email 76 people a
 // download link that 404s. Run it as the LAST step of the release.
-var SETUP_LATEST_VERSION = '2.0.6';
+var SETUP_LATEST_VERSION = '2.0.7';
 
-// Public download links. Must be https://. These 404 until CI publishes the release.
+// FIRST-INSTALL download links. Must be https://.
 //
-// v2.0.6 moves releases to tpansuriya-ship-it — the same account that owns the
-// update manifest Gist, so the manifest and the binaries it points at finally live
-// together. Up to v2.0.5 releases were published under
-// Nishantjha1997/claude-uploader-releases, a personal account we only have read
-// access to, so `git push` returned 403 and no release could be cut at all.
-// Older assets stay reachable there (that repo is public), so existing installs
-// keep working; only new releases move.
+// These are deliberately NOT the GitHub release URLs. The bare executable cannot
+// run on its own: it resolves service-account-key.json from its own directory
+// (GOOGLE_KEY_FILE in claude-usage-uploader.js), and that key is a live credential
+// that must never be attached to a public release. A new user who downloads the
+// raw .exe gets "AUTH_KEY_MISSING" every time.
+//
+// So first installs point at an internal, domain-restricted Drive ZIP containing
+// the executable, the key, and the installer together. Auto-update keeps using the
+// public GitHub URLs in the Gist manifest, which is correct — an already-installed
+// agent has the key sitting beside it, so it only needs the replacement binary.
+//
+// macOS and Linux are intentionally EMPTY: no equivalent bundle exists yet. An
+// empty URL makes sendUserEmail_ refuse to send, which is the right outcome —
+// far better than mailing a Mac user a Windows executable. Build the matching
+// bundles and fill these in if non-Windows machines ever join the fleet.
 var SETUP_DOWNLOAD_URLS = {
-  windows: 'https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.6/ClaudeUsageUploader_v2.0.6-win-x64.exe',
-  macos:   'https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.6/ClaudeUsageUploader_v2.0.6-macos-arm64',
-  linux:   'https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.6/ClaudeUsageUploader_v2.0.6-linux-x64'
+  windows: 'https://drive.google.com/file/d/1u9x8TwE8j2oW5wK3hPSmxrUCM57K3wbP/view?usp=sharing',
+  macos:   '',
+  linux:   ''
 };
 
 // Who receives the Monday 12:00 IST digest. REPLACE THESE PLACEHOLDERS — they
@@ -3943,6 +4295,20 @@ function setupUtilityDistribution() {
     report.applied.push('daily prune + retention-purge trigger: ensured');
   } catch (e) {
     report.warnings.push('Could not install the daily prune trigger: ' + e.toString());
+  }
+  try {
+    var archiveCreated = ensureWeeklyArchiveTrigger_();
+    report.applied.push('daily weekly-report archive trigger: ' + (archiveCreated ? 'installed' : 'already present'));
+    // Prove Drive access now rather than discovering it silently failed later.
+    var access = checkWeeklyArchiveAccess();
+    report.archiveAccess = access;
+    if (!access.canWrite) {
+      report.warnings.push('ARCHIVE NOT WRITABLE: ' + (access.verdict || access.error) +
+                           ' Weekly report folders cannot be created until this is fixed. ' +
+                           (access.fix || ''));
+    }
+  } catch (e) {
+    report.warnings.push('Could not set up the weekly report archive: ' + e.toString());
   }
 
   // 6. Prove the email path resolves end to end before anyone relies on it
@@ -4250,6 +4616,93 @@ function logSetupResult() {
 
 function logRosterDuplicates() {
   Logger.log(JSON.stringify(diagnoseRosterDuplicates(), null, 2));
+}
+
+function logLegacySecretReadiness() {
+  Logger.log(JSON.stringify(checkLegacySecretReadiness(), null, 2));
+}
+
+// v5.1: is it safe yet to empty WEBHOOK_HMAC_SECRET_RETIRED?
+//
+// Removing the retired secret closes a real hole (the old value is public and
+// forgeable) but instantly locks out any agent still signing with it. "Nobody
+// below v2.0.6" is the rule, with one refinement that matters: an agent that has
+// been silent for a week cannot be locked out of anything it is not doing, and it
+// will need the repair kit to come back regardless — and that kit installs
+// v2.0.6. So only agents that are BOTH outdated AND still reporting can actually
+// be harmed. This separates the two so the decision is evidence-based.
+var LEGACY_CUTOFF_VERSION = '2.0.6';
+var LEGACY_RECENT_DAYS = 7;
+
+function checkLegacySecretReadiness() {
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var now = Date.now();
+  var recentMs = LEGACY_RECENT_DAYS * 86400000;
+
+  var blocking = [];      // outdated AND recently reporting — would break
+  var lowRisk = [];       // outdated but long silent — needs the kit anyway
+  var unknownVersion = []; // never reported a version
+  var upToDate = 0;
+
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || '').trim();
+    if (!name) continue;
+    if (normalizeUserStatus_(data[i][REG_COL_STATUS]) === USER_STATUS.REMOVED) continue;
+
+    var version = data[i][6] ? String(data[i][6]).trim() : '';
+    function ms(v) {
+      if (!v) return 0;
+      if (typeof v.getTime === 'function') return v.getTime();
+      var t = new Date(String(v)).getTime();
+      return isFinite(t) ? t : 0;
+    }
+    var lastAlive = Math.max(ms(data[i][3]), ms(data[i][4])); // heartbeat / pong
+    var ageDays = lastAlive ? Math.round((now - lastAlive) / 86400000) : null;
+
+    if (!version) {
+      // No version on file. If it is also silent it is simply not in play.
+      if (lastAlive && (now - lastAlive) < recentMs) {
+        unknownVersion.push({ name: name, lastAliveDaysAgo: ageDays });
+      }
+      continue;
+    }
+    if (compareVersions_(version, LEGACY_CUTOFF_VERSION) >= 0) { upToDate++; continue; }
+
+    var entry = { name: name, version: version, lastAliveDaysAgo: ageDays };
+    if (lastAlive && (now - lastAlive) < recentMs) blocking.push(entry);
+    else lowRisk.push(entry);
+  }
+
+  blocking.sort(function(a, b) { return (a.lastAliveDaysAgo || 0) - (b.lastAliveDaysAgo || 0); });
+
+  var safe = blocking.length === 0 && unknownVersion.length === 0;
+  var verdict;
+  if (safe) {
+    verdict = 'SAFE TO REMOVE. No agent that has reported in the last ' + LEGACY_RECENT_DAYS +
+      ' days is below v' + LEGACY_CUTOFF_VERSION + '. Empty WEBHOOK_HMAC_SECRET_RETIRED ' +
+      '(Code.gs line 18) and redeploy.' +
+      (lowRisk.length ? ' The ' + lowRisk.length + ' long-silent agent(s) listed under lowRisk will be ' +
+        'rejected if they ever wake up — they need the repair kit anyway, which installs v2.0.6.' : '');
+  } else {
+    verdict = 'NOT YET. ' + blocking.length + ' agent(s) are actively reporting on a version below v' +
+      LEGACY_CUTOFF_VERSION + (unknownVersion.length ? ', plus ' + unknownVersion.length +
+      ' reporting with no version on file' : '') + '. Removing the retired secret now would ' +
+      'silence them immediately. Wait for auto-update, or force-update them from the Version Matrix.';
+  }
+
+  return {
+    verdict: verdict,
+    safeToRemove: safe,
+    cutoffVersion: LEGACY_CUTOFF_VERSION,
+    recentlyActiveWindowDays: LEGACY_RECENT_DAYS,
+    upToDateCount: upToDate,
+    blocking: blocking,
+    lowRisk: lowRisk,
+    reportingWithNoVersion: unknownVersion,
+    howToRemove: 'In Code.gs replace lines 18-20 with:  var WEBHOOK_HMAC_SECRET_RETIRED = [];  ' +
+                 'then Ctrl+S and Deploy > Manage deployments > New version.'
+  };
 }
 
 // v5.1: DUPLICATE ROSTER ROWS.

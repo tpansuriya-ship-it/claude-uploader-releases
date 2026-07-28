@@ -38,7 +38,7 @@ const IS_LINUX = process.platform === 'linux';
 const PLATFORM_KEY = IS_WIN ? 'win32' : IS_MAC ? 'darwin' : 'linux';
 
 // -------------------- CONFIGURATION --------------------
-const VERSION = '2.0.6';
+const VERSION = '2.0.7';
 const FORCE_RUN = process.argv.includes('--force');
 const IS_SCHEDULED = process.argv.includes('--scheduled');
 const UPDATED_FROM = (() => {
@@ -67,7 +67,72 @@ const MANIFEST_URL = 'https://gist.githubusercontent.com/tpansuriya-ship-it/efa5
 // of source entirely.
 const WEBHOOK_HMAC_SECRET = 'ss-uploader-hmac-2026b-cab69d71b7b5cc93fe49e24818bc8cc2';
 
-const DRIVE_FOLDER_ID = '0AMXBcPT9R10cUk9PVA';
+// v2.0.7: the Drive upload target is now SERVER-CONTROLLED.
+//
+// Up to v2.0.6 this was a hardcoded constant, so relocating the report folder
+// meant rebuilding the binary and pushing it to every machine — including the
+// dormant ones that never self-update. The server now sends `driveFolderId` on
+// every trigger poll, so the folder can be changed from the dashboard alone.
+//
+// This constant remains the fallback, used when the server sends nothing, sends
+// something malformed, or when the configured folder turns out to be unwritable.
+// Reporting must never stop because of a bad configuration value.
+const DRIVE_FOLDER_ID_DEFAULT = '0AMXBcPT9R10cUk9PVA';
+
+// The folder actually in use. Updated by the poll loop, persisted to config so a
+// restart before the first successful poll still uses the last known-good value.
+let activeDriveFolderId = DRIVE_FOLDER_ID_DEFAULT;
+
+// Drive IDs are URL-safe base64-ish. Anything else is a typo or an injected
+// value and must not reach a Drive query, so we reject it and keep the default.
+function isPlausibleDriveFolderId(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{10,80}$/.test(id.trim());
+}
+
+// Returns the folder to upload into. Single source of truth for the whole
+// upload path — never read the constant directly.
+function getDriveFolderId() {
+  return activeDriveFolderId || DRIVE_FOLDER_ID_DEFAULT;
+}
+
+// Apply a server-sent folder. Returns true if the effective value changed.
+// `persist` writes it to config.json so it survives a restart.
+function applyServerDriveFolderId(id, persist = true) {
+  const next = (id == null ? '' : String(id)).trim();
+  if (!next) return false;                       // server said nothing — keep current
+  if (next === activeDriveFolderId) return false; // no change
+  if (!isPlausibleDriveFolderId(next)) {
+    log(`Ignoring implausible driveFolderId from server: "${next.slice(0, 40)}"`);
+    return false;
+  }
+  const previous = activeDriveFolderId;
+  activeDriveFolderId = next;
+  log(`Drive folder changed by server: ${previous} -> ${next}`);
+  if (persist) {
+    try {
+      const cfg = loadConfig();
+      if (cfg) {
+        cfg.driveFolderId = next;
+        const tmp = CONFIG_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(cfg));
+        fs.renameSync(tmp, CONFIG_FILE);
+      }
+    } catch (e) {
+      log(`Could not persist driveFolderId: ${e.message}`);
+    }
+  }
+  return true;
+}
+
+// Revert to the compiled default after a permissions/not-found failure on the
+// configured folder, so a mistyped folder in the dashboard degrades to "uploads
+// still work, in the old place" instead of "the whole fleet stops reporting".
+function revertDriveFolderToDefault(reason) {
+  if (activeDriveFolderId === DRIVE_FOLDER_ID_DEFAULT) return false;
+  log(`CRITICAL: falling back to the default Drive folder (${DRIVE_FOLDER_ID_DEFAULT}) — ${reason}`);
+  activeDriveFolderId = DRIVE_FOLDER_ID_DEFAULT;
+  return true;
+}
 let globalCcusageJsPath = '';
 let globalCcusageBinPath = '';
 const SERVICE_KEY_FILE = 'service-account-key.json';
@@ -1548,7 +1613,7 @@ async function upload(name, sessionFile, dailyFile) {
   const token = await getDriveAccessToken();
 
   async function findFileId(fileName) {
-    const q = encodeURIComponent(`name='${fileName}' and '${DRIVE_FOLDER_ID}' in parents and trashed=false`);
+    const q = encodeURIComponent(`name='${fileName}' and '${getDriveFolderId()}' in parents and trashed=false`);
     const res = await nodeFetch(
       `https://www.googleapis.com/drive/v3/files?q=${q}&corpora=allDrives&includeItemsFromAllDrives=true&supportsAllDrives=true&fields=files(id)`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -1564,8 +1629,8 @@ async function upload(name, sessionFile, dailyFile) {
     );
     if (!res.ok) throw new Error(`${ERR.DRIVE_VERIFY_FAILED}: files.get ${res.status} for ${fileName}`);
     const data = await res.json();
-    if (!data.parents || !data.parents.includes(DRIVE_FOLDER_ID)) {
-      throw new Error(`${ERR.DRIVE_VERIFY_FAILED}: ${fileName} (${fileId}) not in expected folder`);
+    if (!data.parents || !data.parents.includes(getDriveFolderId())) {
+      throw new Error(`${ERR.DRIVE_VERIFY_FAILED}: ${fileName} (${fileId}) not in expected folder ${getDriveFolderId()}`);
     }
     log(`Verified ${fileName} (${fileId}) in Drive folder`);
     return fileId;
@@ -1583,7 +1648,7 @@ async function upload(name, sessionFile, dailyFile) {
         const metadataObj = { name: fileName };
         if (!existingId) {
             // Only set parents when creating a new file
-            metadataObj.parents = [DRIVE_FOLDER_ID];
+            metadataObj.parents = [getDriveFolderId()];
         }
         const metadata = JSON.stringify(metadataObj);
 
@@ -1628,6 +1693,15 @@ async function upload(name, sessionFile, dailyFile) {
         return data.id;
       } catch (e) {
         log(`Upload attempt ${attempt} failed for ${fileName}: ${e.message}`);
+        // v2.0.7: a server-configured folder that we cannot see or write to would
+        // otherwise fail every attempt forever, silently. Detect that specific
+        // class of failure and drop back to the compiled default so the remaining
+        // retries land somewhere real — reporting degrades, it does not stop.
+        if (/notFound|File not found|insufficientFilePermissions|insufficientPermissions|403|404/i.test(e.message)) {
+          if (revertDriveFolderToDefault(`upload to ${activeDriveFolderId} failed: ${e.message.slice(0, 120)}`)) {
+            continue; // retry immediately against the default folder
+          }
+        }
         if (attempt === MAX_RETRIES) throw e;
         await new Promise(r => setTimeout(r, 2000 * attempt));
       }
@@ -1851,7 +1925,15 @@ async function serviceLoop(cfg) {
   };
   let lastHeartbeatSentAt = Date.now();
 
-  log(`Service loop started v${VERSION} — polling every ${POLL_INTERVAL_MS / 1000}s (pid=${process.pid})`);
+  // v2.0.7: restore the last server-assigned Drive folder before the first poll.
+  // Without this, a restart would upload one round to the compiled default even
+  // though the server had already moved the fleet elsewhere.
+  if (cfg && cfg.driveFolderId) {
+    applyServerDriveFolderId(cfg.driveFolderId, false); // already persisted
+  }
+
+  log(`Service loop started v${VERSION} — polling every ${POLL_INTERVAL_MS / 1000}s ` +
+      `(pid=${process.pid}, driveFolder=${getDriveFolderId()})`);
   writeLocalHealth();
 
   // Independent local liveness signal consumed by the Windows health task.
@@ -1889,6 +1971,11 @@ async function serviceLoop(cfg) {
       // --- Update upload frequency from server ---
       if (trigger.uploadSchedule) currentUploadSchedule = trigger.uploadSchedule;
       else if (trigger.uploadFrequency) currentUploadSchedule.frequency = trigger.uploadFrequency;
+
+      // --- v2.0.7: update the Drive upload target from server ---
+      // Validated and persisted inside applyServerDriveFolderId. A missing or
+      // malformed value leaves the current folder untouched.
+      applyServerDriveFolderId(trigger.driveFolderId);
 
       // --- Handle paused state transitions ---
       const serverPaused = trigger.paused === true;

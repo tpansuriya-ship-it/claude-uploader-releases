@@ -3,7 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $taskNames = @('ClaudeUsageUploader', 'ClaudeUsageUploaderHealth')
-$binaryName = 'ClaudeUsageUploader_v2.0.6-win-x64.exe'
+$binaryName = 'ClaudeUsageUploader_v2.0.7-win-x64.exe'
 $keyName = 'service-account-key.json'
 $sourceBinary = Join-Path $PSScriptRoot $binaryName
 $sourceKey = Join-Path $PSScriptRoot $keyName
@@ -50,7 +50,7 @@ foreach ($uploaderProcess in $uploaderProcesses) {
 }
 Start-Sleep -Seconds 2
 
-# v2.0.6: distinguish a FRESH INSTALL from a REPAIR.
+# v2.0.7: distinguish a FRESH INSTALL from a REPAIR.
 #
 # A machine with no config.json has never completed setup, so when the executable
 # starts it opens the browser registration form and waits for the user — it cannot
@@ -72,7 +72,7 @@ if (Test-Path -LiteralPath $configDir) {
   Remove-Item -LiteralPath (Join-Path $configDir 'service.heartbeat') -Force -ErrorAction SilentlyContinue
 }
 
-Write-Step 'Installing the verified v2.0.6 files without deleting user settings.'
+Write-Step 'Installing the verified v2.0.7 files without deleting user settings.'
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -LiteralPath $sourceBinary -Destination $targetBinary -Force
 Copy-Item -LiteralPath $sourceKey -Destination $targetKey -Force
@@ -82,9 +82,9 @@ Copy-Item -LiteralPath $sourceKey -Destination $targetKey -Force
 Set-Content -LiteralPath (Join-Path $installDir 'launcher.bat') -Value "@echo off`r`nexit /b 0`r`n" -Encoding Ascii
 
 if ($hadConfig) {
-  Write-Step 'Starting v2.0.6 so it can recreate its supervised background tasks.'
+  Write-Step 'Starting v2.0.7 so it can recreate its supervised background tasks.'
 } else {
-  Write-Step 'Starting v2.0.6 - it will open your browser so you can register.'
+  Write-Step 'Starting v2.0.7 - it will open your browser so you can register.'
 }
 Start-Process -FilePath $targetBinary -WorkingDirectory $installDir
 Start-Sleep -Seconds 8
@@ -97,9 +97,9 @@ if ($hadConfig) {
   # intended diagnostic is what the user actually sees.
   cmd.exe /c "schtasks.exe /Query /TN ""ClaudeUsageUploader"" >nul 2>&1"
   if ($LASTEXITCODE -ne 0) {
-    throw 'v2.0.6 started, but the background task was not registered. Run this repair as the same Windows user who runs the uploader (not a different admin account).'
+    throw 'v2.0.7 started, but the background task was not registered. Run this repair as the same Windows user who runs the uploader (not a different admin account).'
   }
-  Write-Step 'Repair complete. Configuration was preserved and v2.0.6 is running.'
+  Write-Step 'Repair complete. Configuration was preserved and v2.0.7 is running.'
 } else {
   # Fresh-install path: the task appears only after the user submits the browser
   # form, so asserting it here would fail a successful install.

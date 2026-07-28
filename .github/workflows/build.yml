@@ -15,7 +15,7 @@ env:
   # then tag v<ver>. Everything downstream reads RELEASE_VERSION rather than
   # repeating the number, which is what made the 2.0.5 -> 2.0.6 bump a ten-place
   # edit and a guaranteed broken build.
-  RELEASE_VERSION: 2.0.6
+  RELEASE_VERSION: 2.0.7
 
 jobs:
   build:
