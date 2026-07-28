@@ -327,18 +327,54 @@
         <!-- v3: Onboarding strip &#8212; devs whose first ping was within the last 14 days -->
         <div id="onboardingStrip" style="display:none;"></div>
 
-        <!-- Manual registration -->
+        <!-- v5: Add User &#8212; name, email, system, optional setup email -->
         <div class="card" style="margin-bottom: 1.5rem;">
           <div class="section-hd">
             <div>
-              <div class="section-title">Register New Developer</div>
-              <div class="section-sub">Add a developer to track compliance and manage their status. Developers are also auto-registered on their uploader's first ping.</div>
+              <div class="section-title">Add User</div>
+              <div class="section-sub">Register a user and optionally email them the utility download link. Users are also auto-registered on their uploader's first ping.</div>
             </div>
           </div>
-          <div class="manage-add">
-            <input type="text" id="newRegDevName" placeholder="Developer Full Name (e.g. Jane Smith)"
-                   onkeydown="if(event.key==='Enter')addRegisteredDeveloperManual()">
-            <button class="btn btn-primary btn-sm" onclick="addRegisteredDeveloperManual()">+ Register</button>
+          <div class="u-form">
+            <div class="u-field">
+              <label class="u-label" for="newRegDevName">Full Name <span style="color:var(--red)">*</span></label>
+              <input type="text" id="newRegDevName" placeholder="e.g. Jane Smith"
+                     onkeydown="if(event.key==='Enter')submitAddUser()">
+              <span class="u-hint">Must match the name they enter during setup.</span>
+            </div>
+            <div class="u-field">
+              <label class="u-label" for="newRegDevEmail">Email Address</label>
+              <input type="email" id="newRegDevEmail" placeholder="jane.smith@sigmasolve.com"
+                     onkeydown="if(event.key==='Enter')submitAddUser()">
+              <span class="u-hint">Required only to send them mail.</span>
+            </div>
+            <div class="u-field">
+              <label class="u-label" for="newRegDevSystem">System</label>
+              <select id="newRegDevSystem"></select>
+              <span class="u-hint">Chooses which download link they receive.</span>
+            </div>
+            <div class="u-field u-wide">
+              <label class="u-check">
+                <input type="checkbox" id="newRegDevSendEmail" onchange="toggleAddUserEmailFields()">
+                <span>Send the setup email with the utility download URL</span>
+              </label>
+              <div class="u-collapse" id="addUserEmailFields">
+                <div class="u-field" style="margin-bottom:12px">
+                  <label class="u-label" for="newRegDevSubject">Subject</label>
+                  <input type="text" id="newRegDevSubject" placeholder="Leave blank to use the saved template">
+                </div>
+                <div class="u-field">
+                  <label class="u-label" for="newRegDevBody">Email Body</label>
+                  <textarea id="newRegDevBody" placeholder="Leave blank to use the saved template"></textarea>
+                  <span class="u-hint">Placeholders: <code>{{name}}</code> <code>{{firstName}}</code> <code>{{system}}</code> <code>{{latestVersion}}</code> <code>{{downloadUrl}}</code></span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="u-actions">
+            <button class="btn btn-primary btn-sm" onclick="submitAddUser()" id="addUserBtn">+ Add User</button>
+            <button class="btn btn-ghost btn-sm" onclick="loadEmailTemplateInto('setup')">Load saved template</button>
+            <span id="addUserMsg" class="u-hint"></span>
           </div>
         </div>
 
@@ -346,13 +382,15 @@
           <div class="section-hd">
             <div>
               <div class="section-title">Registered Users Roster</div>
-              <div class="section-sub">All registered developers &#8212; live presence, activity, and management actions</div>
+              <div class="section-sub">All active users &#8212; status, contact details, live presence, and management actions</div>
             </div>
           </div>
           <div class="table-wrap">
             <table class="data-table" id="devRosterTable">
               <thead><tr>
                 <th>Name</th>
+                <th>Status</th>
+                <th>Email / System</th>
                 <th>Live Presence</th>
                 <th>Last Active</th>
                 <th>Last Upload</th>
@@ -362,6 +400,98 @@
               <tbody id="devRosterTbody"></tbody>
             </table>
           </div>
+        </div>
+
+        <!-- v5: Removed users inside the retention window -->
+        <div class="card" id="removedUsersCard" style="margin-top:1.5rem;display:none;">
+          <div class="section-hd">
+            <div>
+              <div class="section-title">Removed Users</div>
+              <div class="section-sub" id="removedUsersSub">Reports stay available for the retention window, then purge automatically.</div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr>
+                <th>Name</th>
+                <th>Removed On</th>
+                <th>Reports Available For</th>
+                <th>Email</th>
+                <th>Actions</th>
+              </tr></thead>
+              <tbody id="removedUsersTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- v5: Utility distribution &#8212; download URLs + email templates -->
+        <div class="card" style="margin-top:1.5rem;">
+          <div class="section-hd">
+            <div>
+              <div class="section-title">Utility Distribution</div>
+              <div class="section-sub">Download links embedded in setup and update emails. Current release: <b id="utilLatestVersion">&#8212;</b></div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="toggleSection('utilDistBody')">Show / Hide</button>
+          </div>
+          <div class="u-collapse" id="utilDistBody">
+            <div class="u-form">
+              <div class="u-field u-wide">
+                <label class="u-label" for="dlUrlWindows">Windows download URL</label>
+                <input type="url" id="dlUrlWindows" placeholder="https://github.com/.../ClaudeUsageUploader_v2.0.5-win-x64.exe">
+              </div>
+              <div class="u-field u-wide">
+                <label class="u-label" for="dlUrlMacos">macOS download URL</label>
+                <input type="url" id="dlUrlMacos" placeholder="https://github.com/.../ClaudeUsageUploader_v2.0.5-macos-arm64">
+              </div>
+              <div class="u-field u-wide">
+                <label class="u-label" for="dlUrlLinux">Linux download URL</label>
+                <input type="url" id="dlUrlLinux" placeholder="https://github.com/.../ClaudeUsageUploader_v2.0.5-linux-x64">
+              </div>
+            </div>
+            <div class="u-actions">
+              <button class="btn btn-primary btn-sm" onclick="saveDownloadUrls()">Save download URLs</button>
+              <span id="dlUrlMsg" class="u-hint"></span>
+            </div>
+
+            <div style="border-top:1px solid var(--glass-b);margin:18px 0 14px"></div>
+
+            <div class="u-form">
+              <div class="u-field">
+                <label class="u-label" for="tplKind">Email template</label>
+                <select id="tplKind" onchange="loadEmailTemplateEditor()">
+                  <option value="setup">Setup / onboarding</option>
+                  <option value="update">Version update</option>
+                  <option value="reminder">Update reminder (mass)</option>
+                </select>
+              </div>
+              <div class="u-field u-wide">
+                <label class="u-label" for="tplSubject">Subject</label>
+                <input type="text" id="tplSubject">
+              </div>
+              <div class="u-field u-wide">
+                <label class="u-label" for="tplBody">Body</label>
+                <textarea id="tplBody" style="min-height:190px"></textarea>
+                <span class="u-hint">Placeholders: <code>{{name}}</code> <code>{{firstName}}</code> <code>{{email}}</code> <code>{{system}}</code> <code>{{version}}</code> <code>{{latestVersion}}</code> <code>{{downloadUrl}}</code></span>
+              </div>
+            </div>
+            <div class="u-actions">
+              <button class="btn btn-primary btn-sm" onclick="saveEmailTemplate()">Save template</button>
+              <button class="btn btn-ghost btn-sm" onclick="resetEmailTemplateUi()">Reset to default</button>
+              <span id="tplMsg" class="u-hint"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- v5: Compliance &#8212; mass update reminder -->
+        <div class="card" style="margin-top:1.5rem;">
+          <div class="section-hd">
+            <div>
+              <div class="section-title">Mass Update Reminder</div>
+              <div class="section-sub">Email every active user running an outdated utility version, prompting them to update.</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="loadReminderPreview()">&#8635; Refresh</button>
+          </div>
+          <div id="reminderPreview"></div>
         </div>
 
         <!-- v3: CSV Roster Reconciliation -->
@@ -598,6 +728,20 @@
             </div>
           </div>
           <div id="stallScanBox" style="padding:0.85rem 1rem;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:10px;">Loading&#8230;</div>
+        </div>
+
+        <!-- v5: Weekly admin digest (missing reports + outdated versions) -->
+        <div class="card">
+          <div class="card-hd">
+            <div class="card-hd-left">
+              <div class="card-icon ci-indigo">&#128231;</div>
+              <div>
+                <div class="card-title">Weekly Admin Digest</div>
+                <div class="card-subtitle">Every Monday at 12:00 PM IST, emails the recipients below two reports for the week just ended (Monday 00:00 &#8211; Sunday 23:59 IST): users whose report never landed, and users still on an older utility version.</div>
+              </div>
+            </div>
+          </div>
+          <div id="weeklyDigestBox" style="padding:0.85rem 1rem;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:10px;">Loading&#8230;</div>
         </div>
       </div>
 

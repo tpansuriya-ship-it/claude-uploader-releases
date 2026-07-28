@@ -25,10 +25,21 @@ if (-not (Test-Path -LiteralPath $sourceKey -PathType Leaf)) {
 }
 
 Write-Step 'Stopping the existing scheduled tasks.'
+# A missing task is the NORMAL case on a machine that needs repairing, and
+# schtasks reports that on stderr. In Windows PowerShell 5.1, redirecting a
+# native command's stderr with 2>$null wraps every line in a NativeCommandError
+# ErrorRecord — and with $ErrorActionPreference='Stop' (set above) that becomes a
+# TERMINATING error. The repair therefore aborted at its very first step on
+# exactly the machines it exists to fix.
+#
+# Routing through cmd.exe lets the OS discard the output, so PowerShell never
+# sees a stderr stream to convert into an error. cmd /c still surfaces the real
+# exit code, which is all we care about.
 foreach ($taskName in $taskNames) {
-  & schtasks.exe /End /TN $taskName 2>$null | Out-Null
-  & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+  cmd.exe /c "schtasks.exe /End /TN ""$taskName"" >nul 2>&1"
+  cmd.exe /c "schtasks.exe /Delete /TN ""$taskName"" /F >nul 2>&1"
 }
+$global:LASTEXITCODE = 0
 
 Write-Step 'Stopping only Claude Usage Uploader processes.'
 $uploaderProcesses = Get-CimInstance Win32_Process | Where-Object {
@@ -64,9 +75,13 @@ Write-Step 'Starting v2.0.5 so it can recreate its supervised background tasks.'
 Start-Process -FilePath $targetBinary -WorkingDirectory $installDir
 Start-Sleep -Seconds 8
 
-$mainTask = & schtasks.exe /Query /TN 'ClaudeUsageUploader' /FO LIST 2>$null
+# Same stderr trap as above: when the task is absent this wrote a
+# NativeCommandError and aborted with a confusing PowerShell stack instead of the
+# clear message below. cmd /c keeps the exit code and discards the noise, so the
+# intended diagnostic is what the user actually sees.
+cmd.exe /c "schtasks.exe /Query /TN ""ClaudeUsageUploader"" >nul 2>&1"
 if ($LASTEXITCODE -ne 0) {
-  throw 'v2.0.5 started, but the background task was not registered. Run this repair as the same Windows user who runs the uploader.'
+  throw 'v2.0.5 started, but the background task was not registered. Run this repair as the same Windows user who runs the uploader (not a different admin account).'
 }
 
 Write-Step 'Repair complete. Configuration was preserved and v2.0.5 is running.'

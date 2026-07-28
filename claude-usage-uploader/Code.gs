@@ -8,13 +8,24 @@
 // so the secret can be rotated without a code redeploy. Currently-deployed
 // uploader binaries still sign with the constant — keeping it allows a
 // rolling migration once binaries are redeployed.
-var WEBHOOK_HMAC_SECRET_DEFAULT = 'ss-uploader-hmac-2026-b7f3a9c1d4e2';
+// v2.0.6 fleet secret. Must match WEBHOOK_HMAC_SECRET in claude-usage-uploader.js.
+var WEBHOOK_HMAC_SECRET_DEFAULT = 'ss-uploader-hmac-2026b-cab69d71b7b5cc93fe49e24818bc8cc2';
+
+// Secrets from earlier releases, still accepted so agents that have not yet
+// self-updated keep reporting. Each entry is a forgeable value — the whole point
+// of rotating — so empty this array as soon as the Version Matrix shows nobody
+// left below v2.0.6. Leaving it populated indefinitely makes the rotation moot.
+var WEBHOOK_HMAC_SECRET_RETIRED = [
+  'ss-uploader-hmac-2026-b7f3a9c1d4e2'  // <= v2.0.5. Published in a public repo.
+];
+
 var HMAC_STALE_SECS = 300;   // v2: tightened from 7200s (was a 2h replay window)
 var HMAC_FUTURE_TOL = 300;   // Allow up to 5 minutes clock skew tolerance for drifted client machines
 
-// Accept both the Script Properties override and the compiled fleet secret
-// during rolling upgrades. Previously, setting hmac_secret immediately
-// invalidated every already-installed client and produced fleet-wide stalls.
+// Accept the Script Properties override, the compiled fleet secret, and any
+// retired secrets during rolling upgrades. Previously, setting hmac_secret
+// immediately invalidated every already-installed client and produced fleet-wide
+// stalls.
 function getWebhookSecrets_() {
   var secrets = [];
   try {
@@ -22,7 +33,18 @@ function getWebhookSecrets_() {
     if (override && override.length > 8) secrets.push(override);
   } catch (e) {}
   if (secrets.indexOf(WEBHOOK_HMAC_SECRET_DEFAULT) === -1) secrets.push(WEBHOOK_HMAC_SECRET_DEFAULT);
+  for (var i = 0; i < WEBHOOK_HMAC_SECRET_RETIRED.length; i++) {
+    if (secrets.indexOf(WEBHOOK_HMAC_SECRET_RETIRED[i]) === -1) {
+      secrets.push(WEBHOOK_HMAC_SECRET_RETIRED[i]);
+    }
+  }
   return secrets;
+}
+
+// Surfaced by diagnoseWebhookAuth so you can tell at a glance whether the
+// rotation is still carrying a forgeable legacy secret.
+function getRetiredSecretCount_() {
+  return WEBHOOK_HMAC_SECRET_RETIRED.length;
 }
 
 function computeHmac256_(secret, message) {
@@ -68,6 +90,20 @@ function verifyWebhookSignature_(e) {
   if (skew > HMAC_STALE_SECS) return 'stale_ts (' + skew + 's, limit ' + HMAC_STALE_SECS + 's)';
   if (skew < -HMAC_FUTURE_TOL) return 'future_ts (' + (-skew) + 's ahead of server)';
   var body = (e.postData && e.postData.contents) ? e.postData.contents : '';
+
+  // v5.1: distinguish "body was lost in transit" from "signature is genuinely
+  // wrong". Apps Script 302-redirects POSTs to script.googleusercontent.com, and
+  // the ≤v2.0.5 client follows that redirect with https.get() — a bodyless GET.
+  // The signature (a query param) survives; the payload does not. The server then
+  // hashes ts+'.'+'' and can never match, which for months read as 'sig_mismatch'
+  // and sent everyone hunting for a wrong secret. Name it accurately instead.
+  if (!body) {
+    return 'body_lost_in_transit (signature present but request carried no payload — ' +
+           'the client followed a 302 with a bodyless GET, or the deployment is ' +
+           'redirecting anonymous POSTs to a login page. Set the deployment access ' +
+           'to "Anyone" and rebuild the client so redirects re-POST.)';
+  }
+
   var secrets = getWebhookSecrets_();
   var matched = false;
   for (var i = 0; i < secrets.length; i++) {
@@ -179,15 +215,29 @@ function doGet(e) {
 
 // Runs sheet setup + trigger install only once per script version, not on every page load.
 // Keyed by a version string — bump the value to force a re-run after major schema changes.
-var INIT_VERSION = 'v4';
+var INIT_VERSION = 'v5';
 function maybeRunOneTimeInit_() {
   var props = PropertiesService.getScriptProperties();
   if (props.getProperty('initDone') === INIT_VERSION) return; // already done
   ensureRegisteredDevelopersSheet();
   // v3: backfill the new roster activity columns from the legacy log sheets
   // BEFORE cleanupSheets_ deletes HeartbeatLog/ExpectedDevelopers.
-  try { migrateRosterActivity_(); } catch (e) { log_('v3 migration error: ' + e.toString()); }
+  //
+  // v5: this carries its own permanent guard. It is a one-shot v3 cutover, and
+  // re-running it on every INIT_VERSION bump would overwrite live roster
+  // activity with values re-derived from pruned log rows — and re-append rows
+  // for developers who have since been purged from the roster.
+  if (props.getProperty('migratedRosterActivity') !== '1') {
+    try {
+      migrateRosterActivity_();
+      props.setProperty('migratedRosterActivity', '1');
+    } catch (e) { log_('v3 migration error: ' + e.toString()); }
+  }
   installPruneTrigger();
+  // v5: weekly admin digests (missing reports + version drift) every Monday.
+  try { ensureWeeklyDigestTrigger_(); } catch (e) { log_('v5 init: digest trigger error: ' + e.toString()); }
+  // v5: weekly report window is Monday 00:00 IST → Sunday 23:59 IST.
+  try { applyWeeklyGenerationDefault_(); } catch (e) { log_('v5 init: schedule error: ' + e.toString()); }
   cleanupSheets_();
   invalidateCache_();
   props.setProperty('initDone', INIT_VERSION);
@@ -287,7 +337,32 @@ function cleanupSheets_() {
 // rows to a log sheet — keeps cell count flat regardless of fleet uptime.
 // Columns: 1=Name 2=RegisteredAt 3=LastSeen 4=LastHeartbeat 5=LastPong
 //          6=LastUpload 7=Version 8=NextPollAt 9=LastUpdateCheck
-var REG_SHEET_HEADERS = ['Name', 'RegisteredAt', 'LastSeen', 'LastHeartbeat', 'LastPong', 'LastUpload', 'Version', 'NextPollAt', 'LastUpdateCheck'];
+//
+// v5: user-management columns (Email, System, Status, RemovedAt) are appended
+// at the END rather than inserted, so every existing index-based read
+// (data[i][0..8]) and the doPost cols-3–9 range write in upsertRosterActivity_
+// keep working untouched. REG_CORE_HEADERS is the v4 shape and remains the
+// contract that repairRegisteredDevelopersSchema_ validates — the v5 columns
+// are added additively by ensureRegisteredDevelopersSheet() instead, so a
+// missing Email column can never trigger the destructive legacy rewrite.
+var REG_CORE_HEADERS = ['Name', 'RegisteredAt', 'LastSeen', 'LastHeartbeat', 'LastPong', 'LastUpload', 'Version', 'NextPollAt', 'LastUpdateCheck'];
+var REG_USER_HEADERS = ['Email', 'System', 'Status', 'RemovedAt'];
+var REG_SHEET_HEADERS = REG_CORE_HEADERS.concat(REG_USER_HEADERS);
+
+// 0-based column offsets for the v5 user-management fields.
+var REG_COL_EMAIL   = 9;
+var REG_COL_SYSTEM  = 10;
+var REG_COL_STATUS  = 11;
+var REG_COL_REMOVED = 12;
+
+// Lifecycle status — distinct from live presence (Online/Away/Offline), which
+// is derived from heartbeat age on the client. Every user who has not been
+// paused or removed reads as Active.
+var USER_STATUS = { ACTIVE: 'Active', PAUSED: 'Paused', REMOVED: 'Removed' };
+
+// Removed users keep their roster row and their Drive reports for this long so
+// their historical reports stay searchable, then get purged by the daily sweep.
+var REMOVED_RETENTION_DAYS = 120;
 
 function looksLikeIsoDate_(value) {
   if (!value) return false;
@@ -304,8 +379,12 @@ function repairRegisteredDevelopersSchema_(sheet) {
   var data = sheet.getDataRange().getValues();
   if (!data.length) data = [REG_SHEET_HEADERS];
   var headers = data[0].map(function(h) { return String(h || '').trim(); });
-  var exact = headers.length >= REG_SHEET_HEADERS.length;
-  for (var h = 0; h < REG_SHEET_HEADERS.length && exact; h++) exact = headers[h] === REG_SHEET_HEADERS[h];
+  // v5: validate only the CORE (v4) header block. A sheet that is simply
+  // missing the appended user-management columns is healthy — it gets those
+  // added additively by the caller — and must not be dragged through this
+  // destructive rewrite.
+  var exact = headers.length >= REG_CORE_HEADERS.length;
+  for (var h = 0; h < REG_CORE_HEADERS.length && exact; h++) exact = headers[h] === REG_CORE_HEADERS[h];
   if (exact) return false;
 
   var repaired = [REG_SHEET_HEADERS.slice()];
@@ -324,7 +403,14 @@ function repairRegisteredDevelopersSchema_(sheet) {
     var version = looksLikeVersion_(row[6]) ? String(row[6]).trim() : (looksLikeVersion_(row[2]) ? String(row[2]).trim() : '');
     var nextPollAt = looksLikeIsoDate_(row[7]) ? row[7] : '';
     var lastUpdateCheck = looksLikeIsoDate_(row[8]) ? row[8] : '';
-    repaired.push([name, registeredAt, lastSeen, lastHeartbeat, lastPong, lastUpload, version, nextPollAt, lastUpdateCheck]);
+    // v5: carry the user-management columns through the rewrite when the sheet
+    // already had them. A row with no recorded status is treated as Active.
+    var email  = String(row[REG_COL_EMAIL]  || '').trim();
+    var system = String(row[REG_COL_SYSTEM] || '').trim();
+    var status = normalizeUserStatus_(row[REG_COL_STATUS]);
+    var removedAt = looksLikeIsoDate_(row[REG_COL_REMOVED]) ? row[REG_COL_REMOVED] : '';
+    repaired.push([name, registeredAt, lastSeen, lastHeartbeat, lastPong, lastUpload, version, nextPollAt, lastUpdateCheck,
+                   email, system, status, removedAt]);
   }
 
   // Safety snapshot before the destructive rewrite — restorable directly from
@@ -353,16 +439,182 @@ function ensureRegisteredDevelopersSheet() {
     sheet = ss.insertSheet('RegisteredDevelopers');
     sheet.appendRow(REG_SHEET_HEADERS);
     sheet.getRange(1, 1, 1, REG_SHEET_HEADERS.length).setFontWeight('bold');
-  } else {
-    if (repairRegisteredDevelopersSchema_(sheet)) return sheet;
-    var lastCol = sheet.getLastColumn();
-    if (lastCol < REG_SHEET_HEADERS.length) {
-      // Upgrade pre-v3 sheets (Name, RegisteredAt only) in place
-      var missing = REG_SHEET_HEADERS.slice(lastCol);
-      sheet.getRange(1, lastCol + 1, 1, missing.length).setValues([missing]).setFontWeight('bold');
+    return sheet;
+  }
+  if (repairRegisteredDevelopersSchema_(sheet)) return sheet;
+
+  // v5.1: this function runs on EVERY non-throttled webhook ping, so the schema
+  // check is gated behind a script-cache flag. Two reasons:
+  //   1. Cost — it is pure overhead on the hot path once the schema is correct.
+  //   2. Blast radius — anything that throws in here kills the roster write for
+  //      the whole fleet at once (doPost swallows it and returns an error), which
+  //      makes every developer read as Offline. Run it rarely and defensively.
+  var cache = CacheService.getScriptCache();
+  if (cache.get('reg_schema_ok_v5') === '1') return sheet;
+
+  try {
+    // getRange() past the sheet's real column count THROWS. A roster trimmed to
+    // fewer than 13 columns (adminForcePrune, a manual tidy-up, or an imported
+    // sheet) would otherwise take down every heartbeat. Grow it first.
+    ensureRosterColumnCapacity_(sheet);
+
+    // Additively stamp any missing header cell rather than relying on
+    // getLastColumn() alone — a sheet with stray columns past the schema would
+    // otherwise skip the backfill and leave Email/Status unlabelled.
+    var headerRow = sheet.getRange(1, 1, 1, REG_SHEET_HEADERS.length).getValues()[0];
+    var headerFixes = 0;
+    for (var c = 0; c < REG_SHEET_HEADERS.length; c++) {
+      if (String(headerRow[c] || '').trim() !== REG_SHEET_HEADERS[c]) headerFixes++;
     }
+    if (headerFixes > 0) {
+      sheet.getRange(1, 1, 1, REG_SHEET_HEADERS.length)
+        .setValues([REG_SHEET_HEADERS.slice()])
+        .setFontWeight('bold');
+      log_('v5 schema: stamped ' + headerFixes + ' roster header cell(s)');
+      // Only worth sweeping right after the v5 columns appear.
+      // normalizeUserStatus_ already reads a blank cell as Active everywhere,
+      // so the stored default is a cosmetic convenience, not a correctness need.
+      backfillUserStatusDefaults_(sheet);
+    }
+    cache.put('reg_schema_ok_v5', '1', 3600); // re-verify at most hourly
+  } catch (e) {
+    // Never let a schema-maintenance failure break the caller. The activity
+    // write in upsertRosterActivity_ only touches columns 3–9, which exist on
+    // every version of this sheet, so it can safely proceed without the v5 ones.
+    log_('v5 schema check failed (continuing, activity writes unaffected): ' + e.toString());
   }
   return sheet;
+}
+
+// v5.1: read-only triage for "why does the whole fleet read as Offline?".
+// Run it straight from the Apps Script editor (Run ▸ diagnoseFleetPresence) and
+// read the returned object in the execution log — no dashboard needed.
+//
+// Presence depends on LastHeartbeat/LastPong, NOT LastSeen, and the whole fleet
+// freezing at the same moment means the doPost write path stopped rather than 93
+// machines independently going quiet. This surfaces which of those it is.
+function diagnoseFleetPresence() {
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var now = Date.now();
+  var buckets = { under10min: 0, under1h: 0, under6h: 0, under24h: 0, over24h: 0, never: 0 };
+  var newestHeartbeatMs = 0;
+  var newestSeenMs = 0;
+  var total = 0;
+
+  for (var i = 1; i < data.length; i++) {
+    if (!String(data[i][0] || '').trim()) continue;
+    total++;
+    function ms(v) {
+      if (!v) return 0;
+      if (typeof v.getTime === 'function') return v.getTime();
+      var t = new Date(String(v)).getTime();
+      return isFinite(t) ? t : 0;
+    }
+    var hb = Math.max(ms(data[i][3]), ms(data[i][4])); // LastHeartbeat / LastPong
+    var seen = ms(data[i][2]);
+    if (hb > newestHeartbeatMs) newestHeartbeatMs = hb;
+    if (seen > newestSeenMs) newestSeenMs = seen;
+
+    if (!hb) { buckets.never++; continue; }
+    var mins = (now - hb) / 60000;
+    if (mins < 10)        buckets.under10min++;
+    else if (mins < 60)   buckets.under1h++;
+    else if (mins < 360)  buckets.under6h++;
+    else if (mins < 1440) buckets.under24h++;
+    else                  buckets.over24h++;
+  }
+
+  // Recent AppLog errors — schema failures and signature rejections both land here.
+  var recentErrors = [];
+  try {
+    var appLog = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('AppLog');
+    if (appLog) {
+      var rows = getRecentLogRows_(appLog, 300);
+      for (var r = rows.length - 1; r >= 0 && recentErrors.length < 15; r--) {
+        var msg = String(rows[r][1] || '');
+        if (/error|failed|rejected|out of bounds|Unauthorized/i.test(msg)) {
+          var ts = rows[r][0];
+          if (ts && typeof ts.getTime === 'function') ts = ts.toISOString();
+          recentErrors.push(String(ts) + ' — ' + msg);
+        }
+      }
+    }
+  } catch (e) {}
+
+  var minsSinceNewest = newestHeartbeatMs ? Math.round((now - newestHeartbeatMs) / 60000) : null;
+  var verdict;
+  if (buckets.under10min > 0) {
+    verdict = 'Webhook path is HEALTHY — ' + buckets.under10min + ' agent(s) heartbeating inside the 10-min Online window.';
+  } else if (minsSinceNewest === null) {
+    verdict = 'No agent has EVER recorded a heartbeat. Check that the uploader WEBHOOK_URL matches this deployment.';
+  } else if (total > 5 && buckets.under1h === 0 && buckets.under6h === total - buckets.never) {
+    verdict = 'ALL ' + total + ' agents last heartbeated ~' + minsSinceNewest + ' min ago and none since. ' +
+              'A fleet-wide simultaneous stop means the SERVER stopped accepting writes, not that the machines slept. ' +
+              'Check the Executions log for doPost failures and the errors listed below.';
+  } else {
+    verdict = 'Newest heartbeat is ' + minsSinceNewest + ' min old. No agent is inside the 10-min Online window.';
+  }
+
+  return {
+    verdict: verdict,
+    onlineThresholdMinutes: 10,
+    agentHeartbeatIntervalMinutes: 5,
+    rosterUsers: total,
+    rosterColumns: sheet.getMaxColumns(),
+    rosterColumnsRequired: REG_SHEET_HEADERS.length,
+    columnCapacityOk: sheet.getMaxColumns() >= REG_SHEET_HEADERS.length,
+    heartbeatAgeBuckets: buckets,
+    minutesSinceNewestHeartbeat: minsSinceNewest,
+    minutesSinceNewestLastSeen: newestSeenMs ? Math.round((now - newestSeenMs) / 60000) : null,
+    recentErrors: recentErrors
+  };
+}
+
+// Grow the sheet so every schema column physically exists. Without this,
+// getRange(1, 1, 1, 13) on a 9-column sheet throws "out of bounds".
+function ensureRosterColumnCapacity_(sheet) {
+  var maxCols = sheet.getMaxColumns();
+  if (maxCols >= REG_SHEET_HEADERS.length) return false;
+  sheet.insertColumnsAfter(maxCols, REG_SHEET_HEADERS.length - maxCols);
+  log_('v5 schema: grew roster from ' + maxCols + ' to ' + REG_SHEET_HEADERS.length + ' columns');
+  return true;
+}
+
+// Normalize any stored status cell to one of the three known lifecycle values.
+// Blank / unrecognised values mean "never explicitly set" → Active, which is
+// what makes every pre-v5 developer show up as Active with no migration step.
+function normalizeUserStatus_(raw) {
+  var s = String(raw == null ? '' : raw).trim().toLowerCase();
+  if (s === 'removed'  || s === 'deleted')  return USER_STATUS.REMOVED;
+  if (s === 'paused')                       return USER_STATUS.PAUSED;
+  return USER_STATUS.ACTIVE;
+}
+
+// Writes 'Active' into any blank Status cell. Idempotent and cheap: skips the
+// write entirely when there is nothing to fill, so it is safe to call on every
+// ensureRegisteredDevelopersSheet().
+function backfillUserStatusDefaults_(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  var range = sheet.getRange(2, REG_COL_STATUS + 1, lastRow - 1, 1);
+  var values = range.getValues();
+  var changed = false;
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim() === '') {
+      // Only fill rows that actually hold a developer.
+      values[i][0] = USER_STATUS.ACTIVE;
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  // Blank-name rows would get a stray status; mask them out first.
+  var names = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (var j = 0; j < values.length; j++) {
+    if (String(names[j][0] || '').trim() === '') values[j][0] = '';
+  }
+  range.setValues(values);
+  log_('v5 schema: defaulted blank roster Status cells to Active');
 }
 
 function ensurePausedDevelopersSheet_() {
@@ -752,6 +1004,14 @@ function getActiveUsers() {
     var name = String(data[i][0] || '').trim();
     if (!name) continue;
     var key = name.toLowerCase();
+    var isPaused = !!pausedMap[key];
+    var storedStatus = normalizeUserStatus_(data[i][REG_COL_STATUS]);
+    // Pause state lives in its own sheet and is the authority for the Paused
+    // label; the Status cell only distinguishes Removed from everything else.
+    var status = storedStatus === USER_STATUS.REMOVED
+      ? USER_STATUS.REMOVED
+      : (isPaused ? USER_STATUS.PAUSED : USER_STATUS.ACTIVE);
+    var removedAt = isoStr(data[i][REG_COL_REMOVED]);
     users.push({
       name: name,
       registeredAt:        isoStr(data[i][1]),
@@ -762,9 +1022,14 @@ function getActiveUsers() {
       version:             data[i][6] ? String(data[i][6]).trim() : null,
       lastSuccessNextPoll: isoStr(data[i][7]),  // NextPollAt — feeds the Upload Summary "Next Up" cell
       lastUpdateCheck:     data[i][8] ? String(data[i][8]).trim() : null,
+      email:          data[i][REG_COL_EMAIL]  ? String(data[i][REG_COL_EMAIL]).trim()  : '',
+      system:         data[i][REG_COL_SYSTEM] ? String(data[i][REG_COL_SYSTEM]).trim() : '',
+      status:         status,
+      removedAt:      removedAt,
+      retentionDaysLeft: status === USER_STATUS.REMOVED ? removedRetentionDaysLeft_(removedAt) : null,
       pendingTrigger: !!(triggerMap[key] && triggerMap[key]['FORCE_RUN']),
       pendingPing:    !!(triggerMap[key] && triggerMap[key]['PING']),
-      paused:         !!pausedMap[key],
+      paused:         isPaused,
       pausedAt:       pausedMap[key] ? pausedMap[key].pausedAt : null,
       pausedBy:       pausedMap[key] ? pausedMap[key].pausedBy : null
     });
@@ -989,9 +1254,14 @@ function getDashboardData_uncached_() {
   ensureRegisteredDevelopersSheet();
   var regSheet_ = ss.getSheetByName('RegisteredDevelopers');
   var regData_ = regSheet_ ? regSheet_.getDataRange().getValues() : [];
+  // v5: removed users are excluded from the compliance roster — they keep their
+  // row (so their reports stay searchable for the retention window) but must
+  // not inflate "expected" counts or show as perpetually Pending.
   var registeredNames = [];
   for (var ri_ = 1; ri_ < regData_.length; ri_++) {
-    if (regData_[ri_][0]) registeredNames.push(String(regData_[ri_][0]).trim());
+    if (!regData_[ri_][0]) continue;
+    if (normalizeUserStatus_(regData_[ri_][REG_COL_STATUS]) === USER_STATUS.REMOVED) continue;
+    registeredNames.push(String(regData_[ri_][0]).trim());
   }
 
   // 2. Compliance Logs — read all but only keep recent weeks to stay under size limit
@@ -1121,9 +1391,28 @@ function getDashboardData_uncached_() {
     });
   });
 
-  // 5. Registered developers list (from RegisteredDevelopers sheet, with registration date)
-  var registeredDevelopers = regData_.slice(1).filter(function(r){ return r[0]; }).map(function(r) {
-    return { name: String(r[0]).trim(), registeredAt: r[1] ? String(r[1]).trim() : '' };
+  // 5. Registered developers list (from RegisteredDevelopers sheet, with
+  // registration date). v5: carries email/system/status. Removed users are
+  // split into their own list so the roster table shows only live users while
+  // the Removed Users card can still surface them during their retention window.
+  var registeredDevelopers = [];
+  var removedUsers = [];
+  regData_.slice(1).filter(function(r){ return r[0]; }).forEach(function(r) {
+    var removedAt = r[REG_COL_REMOVED] ? String(r[REG_COL_REMOVED]).trim() : '';
+    var entry = {
+      name:         String(r[0]).trim(),
+      registeredAt: r[1] ? String(r[1]).trim() : '',
+      email:        r[REG_COL_EMAIL]  ? String(r[REG_COL_EMAIL]).trim()  : '',
+      system:       r[REG_COL_SYSTEM] ? String(r[REG_COL_SYSTEM]).trim() : '',
+      status:       normalizeUserStatus_(r[REG_COL_STATUS]),
+      removedAt:    removedAt
+    };
+    if (entry.status === USER_STATUS.REMOVED) {
+      entry.retentionDaysLeft = removedRetentionDaysLeft_(removedAt);
+      removedUsers.push(entry);
+    } else {
+      registeredDevelopers.push(entry);
+    }
   });
 
   // 6. Active users with heartbeat / last-seen / pong data
@@ -1140,6 +1429,9 @@ function getDashboardData_uncached_() {
     schemaVersion: SHEET_SCHEMA_VERSION,
     latestVersion: getLatestVersion(),
     registeredDevelopers: registeredDevelopers,
+    removedUsers: removedUsers,
+    removedRetentionDays: REMOVED_RETENTION_DAYS,
+    utilityDownload: getUtilityDownloadConfig(),
     weeks: weeks,
     complianceByWeek: complianceByWeek,
     activeUsers: activeUsers,
@@ -1528,8 +1820,11 @@ function upsertRosterActivity_(name, status, version, nextPollAt, lastUpdateChec
 
   var nowIso = new Date().toISOString();
   if (rowIdx === -1) {
-    // First ping — auto-register
-    sheet.appendRow([name.trim(), nowIso, nowIso, '', '', '', version || '', nextPollAt || '', lastUpdateCheck || '']);
+    // First ping — auto-register. v5: self-registered developers land as Active
+    // with no email/system on file; the admin fills those in from the Users
+    // page (they are only needed to *send* mail, never to track compliance).
+    sheet.appendRow([name.trim(), nowIso, nowIso, '', '', '', version || '', nextPollAt || '', lastUpdateCheck || '',
+                     '', '', USER_STATUS.ACTIVE, '']);
     log_('Registered new developer: ' + name);
     invalidateCache_(); // roster mutation — full flush
     return;
@@ -1871,72 +2166,315 @@ function getRegisteredDevelopersList() {
   var data = SpreadsheetApp.getActiveSpreadsheet()
     .getSheetByName('RegisteredDevelopers').getDataRange().getValues();
   return data.slice(1).filter(function(r){ return r[0]; }).map(function(r) {
-    return { name: String(r[0]).trim(), registeredAt: r[1] ? String(r[1]).trim() : '' };
+    return {
+      name:         String(r[0]).trim(),
+      registeredAt: r[1] ? String(r[1]).trim() : '',
+      email:        r[REG_COL_EMAIL]  ? String(r[REG_COL_EMAIL]).trim()  : '',
+      system:       r[REG_COL_SYSTEM] ? String(r[REG_COL_SYSTEM]).trim() : '',
+      status:       normalizeUserStatus_(r[REG_COL_STATUS])
+    };
   });
 }
 
-function removeRegisteredDeveloper(name) {
-  requireAdmin_();
-  if (!name) return { success: false, error: 'Name is required' };
-  var lock = LockService.getScriptLock();
-  lock.waitLock(10000);
-  var found = false;
-  try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName('RegisteredDevelopers');
-    if (!sheet) return { success: false, error: 'Sheet not found' };
-    var data = sheet.getDataRange().getValues();
-    for (var i = 1; i < data.length; i++) {
-      if (String(data[i][0]).trim().toLowerCase() === name.trim().toLowerCase()) {
-        sheet.deleteRow(i + 1);
-        found = true;
-        break;
-      }
+// Locates a developer's roster row. Returns { sheet, rowIdx (1-based), row }
+// or null. Callers that mutate must already hold the script lock.
+function findRosterRow_(name) {
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var target = String(name || '').trim().toLowerCase();
+  if (!target) return null;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim().toLowerCase() === target) {
+      return { sheet: sheet, rowIdx: i + 1, row: data[i] };
     }
-    if (!found) return { success: false, error: name + ' not found in RegisteredDevelopers' };
-
-    // v3: a deleted developer must not linger in PausedDevelopers
-    var pausedSheet = ss.getSheetByName('PausedDevelopers');
-    if (pausedSheet) {
-      var pData = pausedSheet.getDataRange().getValues();
-      for (var pIdx = 1; pIdx < pData.length; pIdx++) {
-        if (String(pData[pIdx][0]).trim().toLowerCase() === name.trim().toLowerCase()) {
-          pausedSheet.deleteRow(pIdx + 1);
-          break;
-        }
-      }
-    }
-    invalidateCache_();
-    log_('Removed registered developer: ' + name);
-  } finally {
-    lock.releaseLock();
   }
-  // v3: outside the lock — trash their report files in the shared folder
-  var deleted = deleteUploaderDriveFiles_(name);
-  return { success: true, driveFilesDeleted: deleted };
+  return null;
 }
 
-function addRegisteredDeveloper(name) {
+// v5: DELETE IS NOW A SOFT DELETE.
+//
+// Requirement: "reports for removed users should remain available for 120 days
+// from the date of removal." The v3 behaviour (delete the row, immediately trash
+// the Drive JSONs) made that impossible, so removal now stamps
+// Status=Removed + RemovedAt and leaves both the row and the report files
+// alone. purgeExpiredRemovedUsers() does the destructive part once the
+// retention window has elapsed; adminHardDeleteUser() is the manual override.
+//
+// The developer is also pushed into PausedDevelopers so their agent stops
+// uploading on its next poll — otherwise a removed user would keep writing
+// fresh reports for the full 120 days.
+function removeRegisteredDeveloper(name) {
   requireAdmin_();
   if (!name || !name.trim()) return { success: false, error: 'Name is required' };
   name = name.trim();
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    var sheet = ensureRegisteredDevelopersSheet();
-    var data = sheet.getDataRange().getValues();
-    for (var i = 1; i < data.length; i++) {
-      if (String(data[i][0]).trim().toLowerCase() === name.toLowerCase()) {
-        return { success: false, error: name + ' is already registered' };
-      }
+    var hit = findRosterRow_(name);
+    if (!hit) return { success: false, error: name + ' not found in RegisteredDevelopers' };
+    if (normalizeUserStatus_(hit.row[REG_COL_STATUS]) === USER_STATUS.REMOVED) {
+      return { success: false, error: name + ' is already removed' };
     }
-    sheet.appendRow([name, new Date().toISOString()]);
+
+    var nowIso = new Date().toISOString();
+    hit.sheet.getRange(hit.rowIdx, REG_COL_STATUS + 1, 1, 2)
+      .setValues([[USER_STATUS.REMOVED, nowIso]]);
+
+    // Stop their agent uploading — reuse the existing pause channel, which the
+    // client already honours via checkAndClearTrigger's `paused` flag.
+    var who = '';
+    try { who = Session.getActiveUser().getEmail(); } catch (e) { who = 'admin'; }
+    var pausedSheet = ensurePausedDevelopersSheet_();
+    if (!isDeveloperPaused_(SpreadsheetApp.getActiveSpreadsheet(), name)) {
+      pausedSheet.appendRow([name, nowIso, who + ' (removed)']);
+    }
+
     invalidateCache_();
-    log_('Admin manually registered: ' + name);
-    return { success: true };
+    log_('Removed user (soft): ' + name + ' — reports retained until ' +
+         addDaysIso_(nowIso, REMOVED_RETENTION_DAYS));
+    return {
+      success: true,
+      status: USER_STATUS.REMOVED,
+      removedAt: nowIso,
+      retentionDays: REMOVED_RETENTION_DAYS,
+      purgeAfter: addDaysIso_(nowIso, REMOVED_RETENTION_DAYS),
+      driveFilesDeleted: 0
+    };
   } finally {
     lock.releaseLock();
   }
+}
+
+// Undo a soft delete inside the retention window.
+function adminRestoreUser(name) {
+  requireAdmin_();
+  if (!name || !name.trim()) return { success: false, error: 'Name is required' };
+  name = name.trim();
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var hit = findRosterRow_(name);
+    if (!hit) return { success: false, error: name + ' not found' };
+    if (normalizeUserStatus_(hit.row[REG_COL_STATUS]) !== USER_STATUS.REMOVED) {
+      return { success: false, error: name + ' is not removed' };
+    }
+    hit.sheet.getRange(hit.rowIdx, REG_COL_STATUS + 1, 1, 2)
+      .setValues([[USER_STATUS.ACTIVE, '']]);
+    invalidateCache_();
+    log_('Restored user: ' + name);
+  } finally {
+    lock.releaseLock();
+  }
+  // Resume outside the lock — adminResumeDeveloper takes the lock itself.
+  try { adminResumeDeveloper(name); } catch (e) { log_('Restore: resume failed for ' + name + ': ' + e); }
+  return { success: true, status: USER_STATUS.ACTIVE };
+}
+
+// Immediate, irreversible purge: drops the roster row, the paused row, and
+// trashes the Drive reports. This is the old v3 removeRegisteredDeveloper
+// behaviour, now only reachable when an admin explicitly asks for it.
+function adminHardDeleteUser(name) {
+  requireAdmin_();
+  if (!name || !name.trim()) return { success: false, error: 'Name is required' };
+  name = name.trim();
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var hit = findRosterRow_(name);
+    if (!hit) return { success: false, error: name + ' not found in RegisteredDevelopers' };
+    hit.sheet.deleteRow(hit.rowIdx);
+
+    var pausedSheet = ss.getSheetByName('PausedDevelopers');
+    if (pausedSheet) {
+      var pData = pausedSheet.getDataRange().getValues();
+      for (var pIdx = 1; pIdx < pData.length; pIdx++) {
+        if (String(pData[pIdx][0]).trim().toLowerCase() === name.toLowerCase()) {
+          pausedSheet.deleteRow(pIdx + 1);
+          break;
+        }
+      }
+    }
+    invalidateCache_();
+    log_('Hard-deleted user: ' + name);
+  } finally {
+    lock.releaseLock();
+  }
+  // Outside the lock — Drive iteration is slow and must not starve other execs.
+  var deleted = deleteUploaderDriveFiles_(name);
+  return { success: true, driveFilesDeleted: deleted };
+}
+
+// Daily sweep: hard-deletes removed users whose 120-day retention window has
+// expired. Admin-gated because it is destructive and this web app is deployed
+// with ANYONE_ANONYMOUS access — the scheduled trigger goes through
+// purgeExpiredRemovedUsers_internal_ instead, which skips the gate.
+function purgeExpiredRemovedUsers() {
+  requireAdmin_();
+  return purgeExpiredRemovedUsers_internal_();
+}
+
+function purgeExpiredRemovedUsers_internal_() {
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var expired = [];
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || '').trim();
+    if (!name) continue;
+    if (normalizeUserStatus_(data[i][REG_COL_STATUS]) !== USER_STATUS.REMOVED) continue;
+    var removedAt = data[i][REG_COL_REMOVED];
+    if (removedAt && typeof removedAt.getTime === 'function') removedAt = removedAt.toISOString();
+    removedAt = String(removedAt || '').trim();
+    // A Removed row with no RemovedAt stamp has no measurable window — leave it
+    // for an admin rather than guessing and destroying reports early.
+    if (!removedAt) continue;
+    var left = removedRetentionDaysLeft_(removedAt);
+    if (left !== null && left <= 0) expired.push(name);
+  }
+  if (expired.length === 0) return { success: true, purged: 0 };
+
+  var purged = [];
+  expired.forEach(function(n) {
+    try {
+      var r = adminHardDeleteUser_internal_(n);
+      if (r && r.success) purged.push(n);
+    } catch (e) {
+      log_('Retention purge failed for ' + n + ': ' + e.toString());
+    }
+  });
+  if (purged.length > 0) {
+    log_('Retention purge: removed ' + purged.length + ' user(s) past ' +
+         REMOVED_RETENTION_DAYS + '-day window — ' + purged.join(', '));
+  }
+  return { success: true, purged: purged.length, names: purged };
+}
+
+// Same as adminHardDeleteUser but without the admin gate, so the scheduled
+// retention sweep can run with no active user session.
+function adminHardDeleteUser_internal_(name) {
+  var saved = requireAdmin_;
+  requireAdmin_ = function() {};
+  try {
+    return adminHardDeleteUser(name);
+  } finally {
+    requireAdmin_ = saved;
+  }
+}
+
+// Whole-number days remaining in the retention window, or null if unparseable.
+// Negative values are clamped to 0 (already due for purge).
+function removedRetentionDaysLeft_(removedAtIso) {
+  if (!removedAtIso) return null;
+  var t = new Date(removedAtIso).getTime();
+  if (!isFinite(t)) return null;
+  var elapsedDays = (Date.now() - t) / 86400000;
+  return Math.max(0, Math.ceil(REMOVED_RETENTION_DAYS - elapsedDays));
+}
+
+function addDaysIso_(iso, days) {
+  var t = new Date(iso).getTime();
+  if (!isFinite(t)) return '';
+  return new Date(t + days * 86400000).toISOString();
+}
+
+// v5: add-user now carries Email + System and can send the onboarding mail in
+// the same call. The old single-argument form still works — the manual
+// "Register" box and CSV reconciliation both call addRegisteredDeveloper(name).
+function addRegisteredDeveloper(name, email, system) {
+  return adminAddUser({ name: name, email: email, system: system, sendEmail: false });
+}
+
+// opts: { name, email, system, sendEmail, emailSubject, emailBody }
+function adminAddUser(opts) {
+  requireAdmin_();
+  opts = opts || {};
+  var name = String(opts.name || '').trim();
+  if (!name) return { success: false, error: 'Name is required' };
+
+  var email = String(opts.email || '').trim();
+  if (email && !isValidEmail_(email)) {
+    return { success: false, error: 'Not a valid email address: ' + email };
+  }
+  if (opts.sendEmail && !email) {
+    return { success: false, error: 'An email address is required to send the setup email' };
+  }
+  var system = String(opts.system || '').trim();
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  var created = false;
+  try {
+    var sheet = ensureRegisteredDevelopersSheet();
+    var existing = findRosterRow_(name);
+    if (existing) {
+      var exStatus = normalizeUserStatus_(existing.row[REG_COL_STATUS]);
+      if (exStatus === USER_STATUS.REMOVED) {
+        return {
+          success: false,
+          error: name + ' was removed and is still inside the ' + REMOVED_RETENTION_DAYS +
+                 '-day retention window. Restore them instead of re-adding.',
+          canRestore: true
+        };
+      }
+      return { success: false, error: name + ' is already registered' };
+    }
+    var nowIso = new Date().toISOString();
+    sheet.appendRow([name, nowIso, '', '', '', '', '', '', '', email, system, USER_STATUS.ACTIVE, '']);
+    created = true;
+    invalidateCache_();
+    log_('Admin added user: ' + name + (email ? ' <' + email + '>' : '') + (system ? ' [' + system + ']' : ''));
+  } finally {
+    lock.releaseLock();
+  }
+
+  // Send outside the lock — Gmail calls are slow and must not hold the roster.
+  var emailResult = { sent: false };
+  if (created && opts.sendEmail) {
+    emailResult = sendSetupEmail_(
+      { name: name, email: email, system: system },
+      opts.emailSubject,
+      opts.emailBody
+    );
+  }
+  return {
+    success: true,
+    created: created,
+    emailSent: !!emailResult.sent,
+    emailError: emailResult.error || null
+  };
+}
+
+// Edit an existing user's email / system without touching activity columns.
+function adminUpdateUser(name, fields) {
+  requireAdmin_();
+  fields = fields || {};
+  if (!name || !String(name).trim()) return { success: false, error: 'Name is required' };
+  var email = fields.email === undefined ? null : String(fields.email || '').trim();
+  if (email && !isValidEmail_(email)) {
+    return { success: false, error: 'Not a valid email address: ' + email };
+  }
+  var system = fields.system === undefined ? null : String(fields.system || '').trim();
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var hit = findRosterRow_(name);
+    if (!hit) return { success: false, error: name + ' not found' };
+    var vals = [
+      email  === null ? (hit.row[REG_COL_EMAIL]  || '') : email,
+      system === null ? (hit.row[REG_COL_SYSTEM] || '') : system
+    ];
+    hit.sheet.getRange(hit.rowIdx, REG_COL_EMAIL + 1, 1, 2).setValues([vals]);
+    invalidateCache_();
+    log_('Updated user ' + name + ': email=' + vals[0] + ' system=' + vals[1]);
+    return { success: true, email: vals[0], system: vals[1] };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function isValidEmail_(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || '').trim());
 }
 
 function log_(msg) {
@@ -1974,6 +2512,15 @@ function pruneHeartbeatLog() {
     log_('Prune error: ' + e.toString());
   } finally {
     lock.releaseLock();
+  }
+
+  // 3. v5: retention sweep for soft-deleted users. Deliberately outside the
+  // lock above — it takes the script lock itself (via adminHardDeleteUser) and
+  // iterates Drive, so nesting would self-deadlock on the 30s wait.
+  try {
+    purgeExpiredRemovedUsers_internal_(); // no session here — skip the admin gate
+  } catch (e) {
+    log_('Retention purge error: ' + e.toString());
   }
 }
 
@@ -2099,6 +2646,8 @@ function runStallScan() {
   }
   var stalled = [];
   users.forEach(function(u) {
+    // v5: a removed user's agent is *supposed* to be silent — never alert on it.
+    if (u.status === USER_STATUS.REMOVED) return;
     if (!u.lastHeartbeat && !u.lastPong) return; // never pinged — handled by onboarding strip, not stall alert
     var keepAliveMs = 0;
     if (u.lastHeartbeat) keepAliveMs = Math.max(keepAliveMs, new Date(u.lastHeartbeat).getTime());
@@ -2462,6 +3011,15 @@ function adminPauseDeveloper(name) {
 function adminResumeDeveloper(name) {
   requireAdmin_();
   if (!name || !name.trim()) return { success: false, error: 'Name is required' };
+  // v5: a removed user sits in PausedDevelopers precisely so their agent stops
+  // uploading. Resuming them without clearing Removed first would restart the
+  // uploads while they are still absent from the roster. The UI cannot reach
+  // this path (removed users only expose Restore / Purge), but a direct call
+  // could — adminRestoreUser clears the status before it resumes, so it passes.
+  var pre = findRosterRow_(name);
+  if (pre && normalizeUserStatus_(pre.row[REG_COL_STATUS]) === USER_STATUS.REMOVED) {
+    return { success: false, error: name + ' is removed — use Restore instead of Resume' };
+  }
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
@@ -2488,7 +3046,7 @@ function adminResumeDeveloper(name) {
 // v2: schema version this code expects. Bump when ComplianceLog / HeartbeatLog
 // / TriggerQueue / RegisteredDevelopers columns are added or changed. The
 // `getSchemaInfo` endpoint surfaces this on the Health page.
-var SHEET_SCHEMA_VERSION = 'v4.0';
+var SHEET_SCHEMA_VERSION = 'v5.0';
 
 function ensureSettingsSheet_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -2659,4 +3217,1339 @@ function forceSendUpdateBatch(names) {
     }
   });
   return { success: fail === 0, queued: ok, failed: fail, errors: errors };
+}
+
+// ================================================================
+// v5 — UTILITY DISTRIBUTION, USER EMAILS & WEEKLY ADMIN DIGESTS
+// ================================================================
+// Download URLs live in Script Properties rather than being fetched from the
+// release manifest at runtime: getLatestVersion() already dropped its
+// UrlFetchApp lookup because the script.external_request scope can only be
+// granted through an interactive consent screen, which a headless clasp
+// redeploy can never do. Same constraint applies here, same solution.
+
+var DOWNLOAD_PROP_KEYS = {
+  windows: 'download_url_windows',
+  macos:   'download_url_macos',
+  linux:   'download_url_linux'
+};
+
+// The System choice offered when adding a user. `platform` maps the choice to
+// the download URL that gets embedded in their setup email.
+var SYSTEM_OPTIONS = [
+  { value: 'Windows (Company)',  platform: 'windows' },
+  { value: 'Windows (Personal)', platform: 'windows' },
+  { value: 'macOS (Company)',    platform: 'macos'   },
+  { value: 'macOS (Personal)',   platform: 'macos'   },
+  { value: 'Linux (Company)',    platform: 'linux'   },
+  { value: 'Linux (Personal)',   platform: 'linux'   }
+];
+
+// Per-execution memo. A mass send to N users would otherwise re-read the same
+// four Script Properties per recipient (once for the guard, once more inside
+// renderEmailTemplate_), which at fleet scale is hundreds of pointless reads.
+// Reset by setUtilityDownloadConfig so a save is visible immediately.
+var _downloadCfgMemo = null;
+
+function getUtilityDownloadConfig() {
+  if (_downloadCfgMemo) return _downloadCfgMemo;
+  var props = PropertiesService.getScriptProperties();
+  var cfg = { latestVersion: getLatestVersion(), systemOptions: SYSTEM_OPTIONS, urls: {} };
+  Object.keys(DOWNLOAD_PROP_KEYS).forEach(function(platform) {
+    cfg.urls[platform] = '';
+    try {
+      cfg.urls[platform] = String(props.getProperty(DOWNLOAD_PROP_KEYS[platform]) || '').trim();
+    } catch (e) {}
+  });
+  _downloadCfgMemo = cfg;
+  return cfg;
+}
+
+function setUtilityDownloadConfig(urls) {
+  requireAdmin_();
+  urls = urls || {};
+  var props = PropertiesService.getScriptProperties();
+  var saved = {};
+  Object.keys(DOWNLOAD_PROP_KEYS).forEach(function(platform) {
+    if (urls[platform] === undefined) return;
+    var url = String(urls[platform] || '').trim();
+    if (url && !/^https:\/\//i.test(url)) {
+      throw new Error('Download URL for ' + platform + ' must be an https:// link');
+    }
+    props.setProperty(DOWNLOAD_PROP_KEYS[platform], url);
+    saved[platform] = url;
+  });
+  _downloadCfgMemo = null; // force a re-read so the save is visible at once
+  invalidateCache_();
+  log_('Utility download URLs updated: ' + JSON.stringify(saved));
+  return { success: true, config: getUtilityDownloadConfig() };
+}
+
+// Resolve the right download URL for a user's recorded System. Falls back to
+// the Windows URL (the overwhelming majority of the fleet) when the System
+// field is blank or unrecognised.
+function downloadUrlForSystem_(system) {
+  var cfg = getUtilityDownloadConfig();
+  var match = null;
+  for (var i = 0; i < SYSTEM_OPTIONS.length; i++) {
+    if (SYSTEM_OPTIONS[i].value.toLowerCase() === String(system || '').trim().toLowerCase()) {
+      match = SYSTEM_OPTIONS[i];
+      break;
+    }
+  }
+  if (!match) {
+    var s = String(system || '').toLowerCase();
+    if (s.indexOf('mac') !== -1)   match = { platform: 'macos' };
+    else if (s.indexOf('linux') !== -1) match = { platform: 'linux' };
+    else match = { platform: 'windows' };
+  }
+  return cfg.urls[match.platform] || '';
+}
+
+// -------------------- EMAIL TEMPLATES --------------------
+// Admin-editable bodies stored in Script Properties. Placeholders are
+// substituted per recipient so a single template serves the whole fleet.
+// Supported: {{name}} {{firstName}} {{email}} {{system}} {{version}}
+//            {{latestVersion}} {{downloadUrl}}
+
+var EMAIL_TEMPLATE_KINDS = ['setup', 'update', 'reminder'];
+
+var DEFAULT_EMAIL_TEMPLATES = {
+  setup: {
+    subject: 'Action required: install the Claude Usage Uploader',
+    body: 'Hi {{firstName}},\n\n' +
+      'You have been enrolled in Claude Code usage reporting. Please install the ' +
+      'Claude Usage Uploader utility on your {{system}} machine.\n\n' +
+      'Download (v{{latestVersion}}):\n{{downloadUrl}}\n\n' +
+      'Setup takes about a minute:\n' +
+      '  1. Download and run the installer.\n' +
+      '  2. Enter your first and last name exactly as "{{name}}" when prompted.\n' +
+      '  3. Leave it running — it reports automatically in the background.\n\n' +
+      'If the installer reports that it could not register the scheduled task, ' +
+      'right-click it and choose "Run as Administrator".\n\n' +
+      'Thanks,\nSigma Solve Engineering'
+  },
+  update: {
+    subject: 'Please update the Claude Usage Uploader to v{{latestVersion}}',
+    body: 'Hi {{firstName}},\n\n' +
+      'Your Claude Usage Uploader is running v{{version}}. The current release is ' +
+      'v{{latestVersion}}.\n\n' +
+      'Download the latest version here:\n{{downloadUrl}}\n\n' +
+      'Run the installer over your existing setup — your configuration is preserved ' +
+      'and you do not need to re-enter your name.\n\n' +
+      'Thanks,\nSigma Solve Engineering'
+  },
+  reminder: {
+    subject: 'Reminder: update your Claude Usage Uploader to v{{latestVersion}}',
+    body: 'Hi {{firstName}},\n\n' +
+      'This is a reminder that your Claude Usage Uploader (currently v{{version}}) is ' +
+      'out of date. The latest version is v{{latestVersion}}.\n\n' +
+      'Please update at your earliest convenience:\n{{downloadUrl}}\n\n' +
+      'Older versions may stop reporting correctly, which shows up as a compliance ' +
+      'gap against your name.\n\n' +
+      'Thanks,\nSigma Solve Engineering'
+  }
+};
+
+// Per-execution memo for the stored (customised) templates, for the same reason
+// as _downloadCfgMemo: a mass send resolves the same template once per recipient.
+var _templateMemo = {};
+
+function getStoredTemplateMemo_(kind) {
+  if (_templateMemo.hasOwnProperty(kind)) return _templateMemo[kind];
+  var stored = null;
+  try {
+    stored = JSON.parse(PropertiesService.getScriptProperties().getProperty('email_tpl_' + kind) || 'null');
+  } catch (e) {}
+  _templateMemo[kind] = stored;
+  return stored;
+}
+
+function getEmailTemplates() {
+  requireAdmin_();
+  var out = {};
+  EMAIL_TEMPLATE_KINDS.forEach(function(kind) {
+    var stored = getStoredTemplateMemo_(kind);
+    out[kind] = {
+      subject:   (stored && stored.subject) || DEFAULT_EMAIL_TEMPLATES[kind].subject,
+      body:      (stored && stored.body)    || DEFAULT_EMAIL_TEMPLATES[kind].body,
+      isCustom:  !!stored,
+      defaultSubject: DEFAULT_EMAIL_TEMPLATES[kind].subject,
+      defaultBody:    DEFAULT_EMAIL_TEMPLATES[kind].body
+    };
+  });
+  return out;
+}
+
+function setEmailTemplate(kind, subject, body) {
+  requireAdmin_();
+  if (EMAIL_TEMPLATE_KINDS.indexOf(kind) === -1) {
+    return { success: false, error: 'Unknown template: ' + kind };
+  }
+  var s = String(subject || '').trim();
+  var b = String(body || '').trim();
+  if (!s || !b) return { success: false, error: 'Subject and body are both required' };
+  PropertiesService.getScriptProperties()
+    .setProperty('email_tpl_' + kind, JSON.stringify({ subject: s, body: b }));
+  delete _templateMemo[kind];
+  log_('Email template updated: ' + kind);
+  return { success: true };
+}
+
+function resetEmailTemplate(kind) {
+  requireAdmin_();
+  if (EMAIL_TEMPLATE_KINDS.indexOf(kind) === -1) {
+    return { success: false, error: 'Unknown template: ' + kind };
+  }
+  PropertiesService.getScriptProperties().deleteProperty('email_tpl_' + kind);
+  delete _templateMemo[kind];
+  return { success: true };
+}
+
+function renderEmailTemplate_(text, user) {
+  var latest = getUtilityDownloadConfig().latestVersion; // memoized
+  var name = String(user.name || '').trim();
+  var vars = {
+    '{{name}}':          name.replace(/_/g, ' '),
+    '{{firstName}}':     (name.replace(/_/g, ' ').split(/\s+/)[0] || 'there'),
+    '{{email}}':         user.email || '',
+    '{{system}}':        user.system || 'work',
+    '{{version}}':       user.version || 'unknown',
+    '{{latestVersion}}': latest,
+    '{{downloadUrl}}':   downloadUrlForSystem_(user.system)
+  };
+  var out = String(text == null ? '' : text);
+  Object.keys(vars).forEach(function(token) {
+    out = out.split(token).join(vars[token]);
+  });
+  return out;
+}
+
+// Single send path for every user-facing email, so quota failures, missing
+// addresses and missing download URLs are reported the same way everywhere.
+function sendUserEmail_(kind, user, overrideSubject, overrideBody) {
+  if (!user || !user.email) return { sent: false, error: 'no email address on file' };
+  if (!isValidEmail_(user.email)) return { sent: false, error: 'invalid email address' };
+
+  var stored = getStoredTemplateMemo_(kind);
+  var tpl = DEFAULT_EMAIL_TEMPLATES[kind] || DEFAULT_EMAIL_TEMPLATES.setup;
+
+  var subject = overrideSubject || (stored && stored.subject) || tpl.subject;
+  var body    = overrideBody    || (stored && stored.body)    || tpl.body;
+
+  subject = renderEmailTemplate_(subject, user);
+  body    = renderEmailTemplate_(body, user);
+
+  // A setup/update mail whose download link resolved to nothing is worse than
+  // no mail at all — the recipient has nothing to act on. Fail loudly instead.
+  if (!downloadUrlForSystem_(user.system)) {
+    return { sent: false, error: 'no download URL configured for this system — set one on the Users page' };
+  }
+
+  try {
+    GmailApp.sendEmail(user.email, subject, body);
+    return { sent: true };
+  } catch (e) {
+    return { sent: false, error: e.toString() };
+  }
+}
+
+function sendSetupEmail_(user, overrideSubject, overrideBody) {
+  var r = sendUserEmail_('setup', user, overrideSubject, overrideBody);
+  log_('Setup email to ' + (user.email || user.name) + ': ' + (r.sent ? 'sent' : 'FAILED — ' + r.error));
+  return r;
+}
+
+// Re-send the setup / download email to an existing user (Requirement 2b:
+// "send a new email containing the latest utility download URL").
+function sendSetupEmailToUser(name, overrideSubject, overrideBody) {
+  requireAdmin_();
+  var user = lookupUserForEmail_(name);
+  if (!user) return { success: false, error: name + ' not found' };
+  var r = sendSetupEmail_(user, overrideSubject, overrideBody);
+  return { success: r.sent, error: r.error || null };
+}
+
+// Resolve a roster row into the shape the email templates expect.
+function lookupUserForEmail_(name) {
+  var hit = findRosterRow_(name);
+  if (!hit) return null;
+  return {
+    name:    String(hit.row[0]).trim(),
+    email:   hit.row[REG_COL_EMAIL]  ? String(hit.row[REG_COL_EMAIL]).trim()  : '',
+    system:  hit.row[REG_COL_SYSTEM] ? String(hit.row[REG_COL_SYSTEM]).trim() : '',
+    version: hit.row[6] ? String(hit.row[6]).trim() : '',
+    status:  normalizeUserStatus_(hit.row[REG_COL_STATUS])
+  };
+}
+
+// -------------------- MASS UPDATE / REMINDER MAIL --------------------
+// Requirement 4: mass reminder emails prompting users to update.
+// `names` omitted → every Active user whose reported version is behind latest.
+// Returns a per-user breakdown so the UI can show exactly who was skipped and why.
+function sendUpdateReminderEmails(names, kind, overrideSubject, overrideBody) {
+  requireAdmin_();
+  kind = (kind === 'update') ? 'update' : 'reminder';
+
+  var targets = [];
+  if (Array.isArray(names) && names.length > 0) {
+    names.forEach(function(n) {
+      var u = lookupUserForEmail_(n);
+      if (u) targets.push(u);
+      else targets.push({ name: String(n), email: '', _missing: true });
+    });
+  } else {
+    targets = getOutdatedActiveUsers_();
+  }
+
+  if (targets.length === 0) {
+    return { success: true, sent: 0, skipped: 0, results: [], message: 'Every active user is already on the latest version.' };
+  }
+
+  var results = [], sent = 0, skipped = 0;
+  targets.forEach(function(u) {
+    if (u._missing) {
+      skipped++; results.push({ name: u.name, sent: false, error: 'not found in roster' }); return;
+    }
+    if (u.status === USER_STATUS.REMOVED) {
+      skipped++; results.push({ name: u.name, sent: false, error: 'user is removed' }); return;
+    }
+    var r = sendUserEmail_(kind, u, overrideSubject, overrideBody);
+    if (r.sent) sent++; else skipped++;
+    results.push({ name: u.name, email: u.email, sent: r.sent, error: r.error || null });
+  });
+
+  log_('Mass ' + kind + ' email: ' + sent + ' sent, ' + skipped + ' skipped');
+  return { success: true, sent: sent, skipped: skipped, results: results };
+}
+
+// Active users whose reported version is behind getLatestVersion().
+// Users that have never reported a version are excluded — there is nothing to
+// compare, and they are already surfaced by the never-seen/onboarding strip.
+function getOutdatedActiveUsers_() {
+  var latest = getLatestVersion();
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || '').trim();
+    if (!name) continue;
+    if (normalizeUserStatus_(data[i][REG_COL_STATUS]) === USER_STATUS.REMOVED) continue;
+    var version = data[i][6] ? String(data[i][6]).trim() : '';
+    if (!version) continue;
+    if (compareVersions_(version, latest) >= 0) continue;
+    out.push({
+      name:    name,
+      email:   data[i][REG_COL_EMAIL]  ? String(data[i][REG_COL_EMAIL]).trim()  : '',
+      system:  data[i][REG_COL_SYSTEM] ? String(data[i][REG_COL_SYSTEM]).trim() : '',
+      version: version,
+      status:  normalizeUserStatus_(data[i][REG_COL_STATUS])
+    });
+  }
+  return out;
+}
+
+// Server-side semver compare (the client has its own copy in JavaScript.html).
+// Returns <0 if a is older, 0 if equal, >0 if a is newer.
+function compareVersions_(a, b) {
+  var pa = String(a || '0').split(/[.\-+]/);
+  var pb = String(b || '0').split(/[.\-+]/);
+  for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+    var na = parseInt(pa[i], 10); if (!isFinite(na)) na = 0;
+    var nb = parseInt(pb[i], 10); if (!isFinite(nb)) nb = 0;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+// Read-only preview for the Compliance page: who would receive a mass reminder,
+// and who cannot be reached because they have no email on file.
+function getUpdateReminderPreview() {
+  requireAdmin_();
+  var outdated = getOutdatedActiveUsers_();
+  var reachable = outdated.filter(function(u) { return u.email && isValidEmail_(u.email); });
+  var unreachable = outdated.filter(function(u) { return !u.email || !isValidEmail_(u.email); });
+  var urls = getUtilityDownloadConfig().urls;
+  return {
+    latestVersion: getLatestVersion(),
+    outdatedCount: outdated.length,
+    reachable: reachable,
+    unreachable: unreachable,
+    downloadConfigured: !!(urls.windows || urls.macos || urls.linux)
+  };
+}
+
+// -------------------- WEEKLY ADMIN DIGESTS --------------------
+// Requirement 5: every Monday 12:00 PM IST, mail Dhairya + Tejas two reports —
+// users whose weekly report never landed, and users still on an old version.
+// Recipients default to the admin allowlist so the digest is never silently
+// sent nowhere.
+
+function getWeeklyDigestRecipients_() {
+  var list = [];
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty('weekly_digest_recipients') || '';
+    raw.split(/[,\s;]+/).forEach(function(em) {
+      em = em.trim().toLowerCase();
+      if (em && isValidEmail_(em) && list.indexOf(em) === -1) list.push(em);
+    });
+  } catch (e) {}
+  if (list.length === 0) list = getAdminAllowlist_();
+  return list;
+}
+
+function getWeeklyDigestConfig() {
+  requireAdmin_();
+  var raw = '';
+  try { raw = PropertiesService.getScriptProperties().getProperty('weekly_digest_recipients') || ''; } catch (e) {}
+  return {
+    recipients: getWeeklyDigestRecipients_(),
+    explicitlyConfigured: !!raw,
+    usingAdminAllowlistFallback: !raw,
+    triggerInstalled: isWeeklyDigestTriggerInstalled(),
+    scheduleDescription: 'Mondays at 12:00 ' + (Session.getScriptTimeZone() || 'Asia/Kolkata')
+  };
+}
+
+function setWeeklyDigestRecipients(emailsCsv) {
+  requireAdmin_();
+  var clean = String(emailsCsv || '').split(/[,\s;]+/)
+    .map(function(e) { return e.trim().toLowerCase(); })
+    .filter(Boolean);
+  var bad = clean.filter(function(e) { return !isValidEmail_(e); });
+  if (bad.length > 0) return { success: false, error: 'Invalid address(es): ' + bad.join(', ') };
+  PropertiesService.getScriptProperties().setProperty('weekly_digest_recipients', clean.join(','));
+  log_('Weekly digest recipients set to: ' + clean.join(', '));
+  return { success: true, recipients: getWeeklyDigestRecipients_() };
+}
+
+// The Monday-to-Sunday window that just closed. Called on Monday, this returns
+// the *previous* week — the period the reports were supposed to cover.
+function lastCompletedWeekWindow_() {
+  var tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+  var thisMonday = getCurrentWeekStart_();               // yyyy-MM-dd, script tz
+  var parts = thisMonday.split('-');
+  var anchor = new Date(Date.UTC(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10), 12, 0, 0));
+  anchor.setUTCDate(anchor.getUTCDate() - 7);
+  var start = Utilities.formatDate(anchor, tz, 'yyyy-MM-dd');
+  anchor.setUTCDate(anchor.getUTCDate() + 6);
+  var end = Utilities.formatDate(anchor, tz, 'yyyy-MM-dd');
+  return { weekStart: start, weekEnd: end, label: formatWeekLabel_(start, end) };
+}
+
+// "July 20-26 2026" — the folder-naming convention from the requirements,
+// reused here so the digest and the (phase 2) report folders read identically.
+function formatWeekLabel_(startIso, endIso) {
+  var tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+  function d(iso) {
+    var p = iso.split('-');
+    return new Date(Date.UTC(parseInt(p[0], 10), parseInt(p[1], 10) - 1, parseInt(p[2], 10), 12, 0, 0));
+  }
+  var s = d(startIso), e = d(endIso);
+  var sMonth = Utilities.formatDate(s, tz, 'MMMM');
+  var eMonth = Utilities.formatDate(e, tz, 'MMMM');
+  var sDay   = Utilities.formatDate(s, tz, 'd');
+  var eDay   = Utilities.formatDate(e, tz, 'd');
+  var year   = Utilities.formatDate(e, tz, 'yyyy');
+  return (sMonth === eMonth)
+    ? sMonth + ' ' + sDay + '-' + eDay + ' ' + year
+    : sMonth + ' ' + sDay + '-' + eMonth + ' ' + eDay + ' ' + year;
+}
+
+// Active users with no SUCCESS logged for the given week-start.
+function getMissingReportUsers_(weekStart) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+
+  var roster = [];
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || '').trim();
+    if (!name) continue;
+    if (normalizeUserStatus_(data[i][REG_COL_STATUS]) === USER_STATUS.REMOVED) continue;
+    roster.push({
+      name:       name,
+      email:      data[i][REG_COL_EMAIL]  ? String(data[i][REG_COL_EMAIL]).trim()  : '',
+      system:     data[i][REG_COL_SYSTEM] ? String(data[i][REG_COL_SYSTEM]).trim() : '',
+      lastUpload: data[i][5] ? String(data[i][5]) : ''
+    });
+  }
+
+  // Paused users are intentionally not reporting — excluding them keeps the
+  // digest actionable rather than a standing list of known-quiet machines.
+  var pausedSet = getPausedDevelopersMap_();
+
+  var reported = {};
+  var logSheet = ss.getSheetByName('ComplianceLog');
+  if (logSheet) {
+    var rows = getRecentLogRows_(logSheet, 8000);
+    for (var r = 0; r < rows.length; r++) {
+      if (!rows[r][0]) continue;
+      var ws = rows[r][2];
+      if (ws && typeof ws.getTime === 'function') {
+        ws = Utilities.formatDate(ws, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      } else {
+        ws = String(ws || '').trim();
+      }
+      if (ws !== weekStart) continue;
+      if (String(rows[r][3] || '').trim().toUpperCase() !== 'SUCCESS') continue;
+      reported[String(rows[r][1] || '').trim().toLowerCase()] = true;
+    }
+  }
+
+  return roster.filter(function(u) {
+    if (pausedSet[u.name.toLowerCase()]) return false;
+    return !reported[u.name.toLowerCase()];
+  });
+}
+
+// The Monday 12:00 digest. Public (no requireAdmin_) so the time-driven
+// trigger can run it with no active user session.
+function runWeeklyAdminDigest() {
+  var win = lastCompletedWeekWindow_();
+  var missing  = getMissingReportUsers_(win.weekStart);
+  var outdated = getOutdatedActiveUsers_();
+  var latest   = getLatestVersion();
+  var recipients = getWeeklyDigestRecipients_();
+
+  if (recipients.length === 0) {
+    log_('WeeklyDigest: no recipients configured (weekly_digest_recipients and admin_emails are both empty) — skipping');
+    return { success: false, error: 'No recipients configured', missing: missing.length, outdated: outdated.length };
+  }
+
+  var lines = [];
+  lines.push('Claude Usage Uploader — weekly compliance digest');
+  lines.push('Reporting period: ' + win.label + '  (' + win.weekStart + ' 00:00 to ' + win.weekEnd + ' 23:59 ' + (Session.getScriptTimeZone() || 'Asia/Kolkata') + ')');
+  lines.push('');
+  lines.push('--------------------------------------------------');
+  lines.push('1. MISSING REPORTS (' + missing.length + ')');
+  lines.push('--------------------------------------------------');
+  if (missing.length === 0) {
+    lines.push('  All active users uploaded a report for this period.');
+  } else {
+    lines.push('  These active users have no successful upload for the period:');
+    lines.push('');
+    missing.forEach(function(u) {
+      var last = u.lastUpload ? ('last upload ' + String(u.lastUpload).substring(0, 10)) : 'never uploaded';
+      lines.push('  • ' + u.name + ' — ' + last + (u.email ? '  <' + u.email + '>' : '  (no email on file)'));
+    });
+  }
+  lines.push('');
+  lines.push('--------------------------------------------------');
+  lines.push('2. OUTDATED UTILITY VERSIONS (' + outdated.length + ')');
+  lines.push('--------------------------------------------------');
+  lines.push('  Current release: v' + latest);
+  lines.push('');
+  if (outdated.length === 0) {
+    lines.push('  Every active user is on the latest version.');
+  } else {
+    outdated.forEach(function(u) {
+      lines.push('  • ' + u.name + ' — running v' + u.version +
+                 (u.email ? '  <' + u.email + '>' : '  (no email on file)'));
+    });
+    lines.push('');
+    lines.push('  Use the Users page → "Email update reminder" to notify them, or the');
+    lines.push('  Version Matrix page to push a silent hot-patch.');
+  }
+  lines.push('');
+  lines.push('--------------------------------------------------');
+  lines.push('Generated ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Kolkata', 'yyyy-MM-dd HH:mm z'));
+
+  var subject = '[Claude Usage] Weekly digest ' + win.label +
+                ' — ' + missing.length + ' missing, ' + outdated.length + ' outdated';
+  try {
+    GmailApp.sendEmail(recipients.join(','), subject, lines.join('\n'));
+    log_('WeeklyDigest: sent to ' + recipients.join(', ') +
+         ' (' + missing.length + ' missing, ' + outdated.length + ' outdated)');
+  } catch (e) {
+    log_('WeeklyDigest: send failed: ' + e.toString());
+    return { success: false, error: e.toString() };
+  }
+
+  return {
+    success: true,
+    period: win,
+    recipients: recipients,
+    missingCount: missing.length,
+    outdatedCount: outdated.length,
+    missing: missing,
+    outdated: outdated
+  };
+}
+
+// Admin-gated entry point for the dashboard's "Send now" button.
+// runWeeklyAdminDigest itself stays ungated so the time-driven trigger can call
+// it with no active user session — but this web app is deployed with
+// ANYONE_ANONYMOUS access, so the client must not reach the ungated version
+// directly or any visitor could fire the digest at will.
+function adminSendWeeklyDigestNow() {
+  requireAdmin_();
+  return runWeeklyAdminDigest();
+}
+
+// Preview the digest from the dashboard without emailing anyone.
+function previewWeeklyAdminDigest() {
+  requireAdmin_();
+  var win = lastCompletedWeekWindow_();
+  return {
+    period: win,
+    recipients: getWeeklyDigestRecipients_(),
+    latestVersion: getLatestVersion(),
+    missing: getMissingReportUsers_(win.weekStart),
+    outdated: getOutdatedActiveUsers_()
+  };
+}
+
+function isWeeklyDigestTriggerInstalled() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'runWeeklyAdminDigest') return true;
+  }
+  return false;
+}
+
+// Idempotent installer used by the one-time init. Script timezone is
+// Asia/Kolkata (see appsscript.json), so atHour(12) is 12:00 PM IST.
+function ensureWeeklyDigestTrigger_() {
+  if (isWeeklyDigestTriggerInstalled()) return false;
+  ScriptApp.newTrigger('runWeeklyAdminDigest')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)
+    .atHour(12)
+    .create();
+  log_('WeeklyDigest: trigger installed (Mondays 12:00 ' + (Session.getScriptTimeZone() || 'Asia/Kolkata') + ')');
+  return true;
+}
+
+function installWeeklyDigestTrigger() {
+  requireAdmin_();
+  var created = ensureWeeklyDigestTrigger_();
+  return { success: true, created: created, message: created ? 'Weekly digest trigger installed' : 'Already installed' };
+}
+
+function uninstallWeeklyDigestTrigger() {
+  requireAdmin_();
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'runWeeklyAdminDigest') {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removed++;
+    }
+  }
+  return { success: true, removed: removed };
+}
+
+// ================================================================
+// v5.1 — ONE-TIME SETUP HELPER
+// ================================================================
+// Everything the v5 features need that cannot be inferred from the sheets lives
+// in Script Properties. Rather than making you click through Project Settings
+// and type key/value pairs by hand, edit the four constants below and run this
+// function once from the editor (Run ▸ setupUtilityDistribution).
+//
+// Re-running it is safe: it overwrites the same keys with the same values.
+//
+// NOTE ON THE TWO VERSION SOURCES — they are independent and must agree:
+//   • The AGENT self-updates by reading the GitHub Gist manifest
+//     (gist.githubusercontent.com/.../version.json). Only editing the Gist
+//     changes what the fleet installs. This function cannot touch it — Apps
+//     Script has no external-request scope here, by deliberate design.
+//   • THIS DASHBOARD decides who is "outdated" from LATEST_VERSION below.
+// Ship a new binary => update the Gist AND re-run this with the new version,
+// or the Version Matrix and the reminder emails will report the wrong thing.
+
+// --- EDIT THESE FOUR, THEN RUN ---------------------------------------------
+
+// Must match `latestVersion` in the Gist manifest.
+//
+// ⚠ ORDER MATTERS. These are already set to 2.0.6, but the v2.0.6 release does not
+// exist until you have tagged + pushed and CI has published it. Do NOT run
+// setupUtilityDistribution until the Gist says 2.0.6, or the dashboard will flag
+// the whole fleet as outdated and the mass-reminder will email 76 people a
+// download link that 404s. Run it as the LAST step of the release.
+var SETUP_LATEST_VERSION = '2.0.6';
+
+// Public download links. Must be https://. These 404 until CI publishes the release.
+//
+// v2.0.6 moves releases to tpansuriya-ship-it — the same account that owns the
+// update manifest Gist, so the manifest and the binaries it points at finally live
+// together. Up to v2.0.5 releases were published under
+// Nishantjha1997/claude-uploader-releases, a personal account we only have read
+// access to, so `git push` returned 403 and no release could be cut at all.
+// Older assets stay reachable there (that repo is public), so existing installs
+// keep working; only new releases move.
+var SETUP_DOWNLOAD_URLS = {
+  windows: 'https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.6/ClaudeUsageUploader_v2.0.6-win-x64.exe',
+  macos:   'https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.6/ClaudeUsageUploader_v2.0.6-macos-arm64',
+  linux:   'https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.6/ClaudeUsageUploader_v2.0.6-linux-x64'
+};
+
+// Who receives the Monday 12:00 IST digest. REPLACE THESE PLACEHOLDERS — they
+// are intentionally invalid so a typo can never silently mail the wrong person.
+var SETUP_DIGEST_RECIPIENTS = 'REPLACE_dhairya@sigmasolve.com, REPLACE_tejas@sigmasolve.com';
+
+// Who may use the admin actions. Leave '' to stay in pilot mode (any visitor
+// with the link can act — fine for a pilot, not for production).
+var SETUP_ADMIN_EMAILS = '';
+
+// --------------------------------------------------------------------------
+
+function setupUtilityDistribution() {
+  var report = { applied: [], skipped: [], warnings: [] };
+  var props = PropertiesService.getScriptProperties();
+
+  // 1. Latest version (drives the dashboard's outdated/drift detection)
+  props.setProperty('latest_uploader_version', String(SETUP_LATEST_VERSION).trim());
+  report.applied.push('latest_uploader_version = ' + SETUP_LATEST_VERSION);
+
+  // 2. Download URLs — setUtilityDownloadConfig validates the https:// scheme
+  var urlResult = setUtilityDownloadConfig(SETUP_DOWNLOAD_URLS);
+  Object.keys(SETUP_DOWNLOAD_URLS).forEach(function(p) {
+    report.applied.push('download_url_' + p + ' = ' + SETUP_DOWNLOAD_URLS[p]);
+  });
+
+  // 3. Digest recipients — refuse the shipped placeholders outright
+  if (/REPLACE_/i.test(SETUP_DIGEST_RECIPIENTS)) {
+    report.skipped.push('weekly_digest_recipients — still contains the REPLACE_ placeholders');
+    report.warnings.push('Digest recipients NOT set. Edit SETUP_DIGEST_RECIPIENTS with the real ' +
+                         'addresses and re-run, or set them on the Health page. Until then the ' +
+                         'Monday digest falls back to admin_emails, and is skipped if that is empty too.');
+  } else {
+    var r = setWeeklyDigestRecipients(SETUP_DIGEST_RECIPIENTS);
+    if (r.success) report.applied.push('weekly_digest_recipients = ' + r.recipients.join(', '));
+    else report.warnings.push('Digest recipients rejected: ' + r.error);
+  }
+
+  // 4. Admin allowlist (optional — empty keeps pilot mode)
+  if (String(SETUP_ADMIN_EMAILS).trim()) {
+    var a = setAdminAllowlist(SETUP_ADMIN_EMAILS);
+    report.applied.push('admin_emails = ' + a.allowlist.join(', '));
+  } else {
+    report.skipped.push('admin_emails — left empty, dashboard stays in pilot mode (no access gate)');
+    report.warnings.push('PILOT MODE: anyone with the web-app link can add/remove users and send ' +
+                         'mail. Set SETUP_ADMIN_EMAILS before treating this as production.');
+  }
+
+  // 5. Make sure the scheduled jobs actually exist
+  try {
+    var digestCreated = ensureWeeklyDigestTrigger_();
+    report.applied.push('weekly digest trigger: ' + (digestCreated ? 'installed' : 'already present'));
+  } catch (e) {
+    report.warnings.push('Could not install the weekly digest trigger: ' + e.toString());
+  }
+  try {
+    installPruneTrigger();
+    report.applied.push('daily prune + retention-purge trigger: ensured');
+  } catch (e) {
+    report.warnings.push('Could not install the daily prune trigger: ' + e.toString());
+  }
+
+  // 6. Prove the email path resolves end to end before anyone relies on it
+  var probe = downloadUrlForSystem_('Windows (Company)');
+  report.emailPathReady = !!probe;
+  if (!probe) report.warnings.push('Download URL for Windows did not resolve — setup emails will refuse to send.');
+
+  report.currentConfig = getUtilityDownloadConfig();
+  report.reminder = 'The AGENT auto-updates from the GitHub Gist, which this function cannot edit. ' +
+                    'Shipping a new binary means updating the Gist too, then re-running this with the new version.';
+
+  log_('setupUtilityDistribution: ' + report.applied.length + ' setting(s) applied, ' +
+       report.warnings.length + ' warning(s)');
+  return report;
+}
+
+// Requirement 5: the weekly report period runs Monday 00:00 IST → Sunday 23:59
+// IST, so the fleet's generation schedule is pinned to Monday 00:00. Applied
+// once, on the v5 init, and logged — an admin can still change it afterwards
+// from the Settings card and this will not overwrite them again.
+function applyWeeklyGenerationDefault_() {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('weeklyScheduleAligned') === '1') return false;
+  var sheet = ensureSettingsSheet_();
+  setSettingValue_(sheet, 'uploadFrequency', 'weekly');
+  setSettingValue_(sheet, 'globalUploadDay', 'Monday');
+  setSettingValue_(sheet, 'globalUploadTime', '00:00');
+  props.setProperty('weeklyScheduleAligned', '1');
+  invalidateCache_();
+  log_('v5 init: fleet generation schedule pinned to weekly / Monday / 00:00 ' +
+       (Session.getScriptTimeZone() || 'Asia/Kolkata'));
+  return true;
+}
+
+// ================================================================
+// v5.1 — LOGGING WRAPPERS
+// ================================================================
+// The Apps Script editor never prints a function's return value, so running
+// diagnoseFleetPresence() or setupUtilityDistribution() directly shows only
+// "Execution completed" with an empty log. Run these instead — they serialise
+// the result into the execution log where you can actually read it.
+
+function logFleetDiagnosis() {
+  Logger.log(JSON.stringify(diagnoseFleetPresence(), null, 2));
+}
+
+function logWebhookAuthDiagnosis() {
+  Logger.log(JSON.stringify(diagnoseWebhookAuth(), null, 2));
+}
+
+// Pass a name to inspect one person, or omit for the whole fleet summary.
+//   logDriveTruth()                → fleet summary + the mismatched users
+//   logDriveTruth('Umang_Patel')   → just that user
+function logDriveTruth(name) {
+  Logger.log(JSON.stringify(diagnoseDriveVsRoster(name), null, 2));
+}
+
+// v5.1: GROUND TRUTH — compares what is actually sitting in the shared Drive
+// folder against what the roster believes.
+//
+// Why this exists: report files reach Drive through the service account, which
+// never touches the GAS webhook. Heartbeats and the SUCCESS ping DO go through
+// the webhook. So while signature verification is failing, a developer can be
+// uploading perfectly while the dashboard reports them Offline and
+// non-compliant. Drive file mtimes are the only trustworthy record in that
+// situation — this reads them directly.
+function diagnoseDriveVsRoster(onlyName) {
+  var filter = String(onlyName || '').trim().toLowerCase();
+
+  // 1. Index the real files by developer prefix.
+  var driveFiles = {};
+  var scanned = 0, skipped = 0;
+  try {
+    var folder = DriveApp.getFolderById(SHARED_DRIVE_FOLDER_ID);
+    var files = folder.getFiles();
+    while (files.hasNext()) {
+      var f = files.next();
+      if (f.isTrashed()) continue;
+      var fn = f.getName();
+      var isDaily   = /_claude_daily\.json$/i.test(fn);
+      var isSession = /_claude_session\.json$/i.test(fn);
+      if (!isDaily && !isSession) { skipped++; continue; }
+      scanned++;
+      var prefix = fn.replace(/_claude_(daily|session)\.json$/i, '');
+      var key = prefix.toLowerCase();
+      if (!driveFiles[key]) driveFiles[key] = { prefix: prefix, daily: null, session: null };
+      var stamp = f.getLastUpdated();
+      if (isDaily) driveFiles[key].daily = stamp;
+      else         driveFiles[key].session = stamp;
+    }
+  } catch (e) {
+    return { error: 'Could not read the shared Drive folder: ' + e.toString(),
+             hint: 'The executing account needs at least Content Manager on the shared drive.' };
+  }
+
+  // 2. Walk the roster and compare.
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var rows = [];
+  var summary = {
+    rosterUsers: 0, driveFilePairsFound: Object.keys(driveFiles).length,
+    driveNewerThanRoster: 0, rosterMatchesDrive: 0, noDriveFileAtAll: 0
+  };
+
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || '').trim();
+    if (!name) continue;
+    if (normalizeUserStatus_(data[i][REG_COL_STATUS]) === USER_STATUS.REMOVED) continue;
+    if (filter && name.toLowerCase().indexOf(filter) === -1) continue;
+    summary.rosterUsers++;
+
+    // Uploader writes <Name_with_underscores>_claude_*.json
+    var key = name.replace(/\s+/g, '_').toLowerCase();
+    var df = driveFiles[key] || null;
+
+    function ms(v) {
+      if (!v) return 0;
+      if (typeof v.getTime === 'function') return v.getTime();
+      var t = new Date(String(v)).getTime();
+      return isFinite(t) ? t : 0;
+    }
+    var rosterUploadMs = ms(data[i][5]); // LastUpload, written only by the webhook
+    var driveNewestMs = df ? Math.max(ms(df.daily), ms(df.session)) : 0;
+
+    var state;
+    if (!df) {
+      state = 'NO_DRIVE_FILE';
+      summary.noDriveFileAtAll++;
+    } else if (driveNewestMs > rosterUploadMs + 60000) {
+      // Drive is materially ahead of what the roster recorded → the upload
+      // worked but its SUCCESS ping never got accepted.
+      state = 'DRIVE_NEWER_THAN_ROSTER';
+      summary.driveNewerThanRoster++;
+    } else {
+      state = 'IN_SYNC';
+      summary.rosterMatchesDrive++;
+    }
+
+    if (filter || state !== 'IN_SYNC') {
+      rows.push({
+        name: name,
+        state: state,
+        driveDailyModified:   df && df.daily   ? df.daily.toISOString()   : null,
+        driveSessionModified: df && df.session ? df.session.toISOString() : null,
+        driveNewestAgeHours:  driveNewestMs ? Math.round((Date.now() - driveNewestMs) / 3600000) : null,
+        rosterLastUpload:     rosterUploadMs ? new Date(rosterUploadMs).toISOString() : null,
+        rosterLastUploadAgeHours: rosterUploadMs ? Math.round((Date.now() - rosterUploadMs) / 3600000) : null,
+        hoursRosterIsBehind: (driveNewestMs && rosterUploadMs)
+          ? Math.round((driveNewestMs - rosterUploadMs) / 3600000) : null
+      });
+    }
+  }
+
+  rows.sort(function(a, b) { return (b.hoursRosterIsBehind || 0) - (a.hoursRosterIsBehind || 0); });
+
+  var verdict;
+  if (summary.driveNewerThanRoster > 0) {
+    verdict = summary.driveNewerThanRoster + ' user(s) have FRESHER files in Drive than the roster knows about. ' +
+      'Their uploads are working; only the status ping is being lost. Treat these people as COMPLIANT — ' +
+      'the dashboard is under-reporting them because of the webhook signature failure, not because they did nothing.';
+  } else if (summary.noDriveFileAtAll === summary.rosterUsers && summary.rosterUsers > 0) {
+    verdict = 'No Drive files found for any user checked. Either the folder ID is wrong or nothing has ever uploaded.';
+  } else {
+    verdict = 'Roster and Drive agree for everyone checked — no hidden uploads. Missing reports are genuinely missing.';
+  }
+
+  return {
+    verdict: verdict,
+    scope: filter ? ('filtered to names containing "' + onlyName + '"') : 'entire active roster',
+    summary: summary,
+    driveScan: { reportFilesSeen: scanned, otherFilesIgnored: skipped, folderId: SHARED_DRIVE_FOLDER_ID },
+    users: rows.slice(0, 100),
+    note: 'rosterLastUpload comes from the SUCCESS webhook ping; drive*Modified comes from the file itself. ' +
+          'A gap between them isolates a reporting-channel fault from a genuine non-upload.'
+  };
+}
+
+// v5.1: pinpoint WHY doPost is answering sig_mismatch.
+//
+// The check has three independent inputs — the secret, the signed message
+// (ts + '.' + body), and the freshness/replay window. This exercises the exact
+// verifier the fleet hits, using a signature built the same way the Node client
+// builds it, so a pass proves the SERVER side is sound and the fault is on the
+// client or in transit. Reveals no secret values, only lengths and fingerprints.
+function diagnoseWebhookAuth() {
+  var out = { checks: [], secretState: {}, rejectionHistory: {} };
+
+  // --- 1. Which secrets will the verifier accept? ---
+  var secrets = getWebhookSecrets_();
+  var override = '';
+  try { override = PropertiesService.getScriptProperties().getProperty('hmac_secret') || ''; } catch (e) {}
+  out.secretState = {
+    acceptedSecretCount: secrets.length,
+    overrideConfigured: !!override,
+    overrideLength: override ? override.length : 0,
+    // Fingerprint, not the secret — enough to compare against the client build.
+    compiledDefaultFingerprint: computeHmac256_(WEBHOOK_HMAC_SECRET_DEFAULT, 'fingerprint').substring(0, 12),
+    compiledDefaultLength: WEBHOOK_HMAC_SECRET_DEFAULT.length,
+    retiredSecretsStillAccepted: getRetiredSecretCount_(),
+    retiredSecretWarning: getRetiredSecretCount_() > 0
+      ? 'A retired (publicly known) secret is still accepted so pre-v2.0.6 agents keep ' +
+        'reporting. Anyone can forge pings until it is removed. Empty ' +
+        'WEBHOOK_HMAC_SECRET_RETIRED once the Version Matrix shows nobody below v2.0.6.'
+      : null,
+    note: 'The compiled default is always accepted, so an override can never lock out existing binaries.'
+  };
+
+  // --- 2. Round-trip the verifier with a correctly-signed request ---
+  // Mirrors the client exactly: sig = HMAC_SHA256(secret, ts + '.' + rawBody).
+  var body = JSON.stringify({ name: 'DIAG_SELFTEST', status: 'HEARTBEAT', message: 'auth self-test' });
+  var ts = Math.floor(Date.now() / 1000).toString();
+  var goodSig = computeHmac256_(WEBHOOK_HMAC_SECRET_DEFAULT, ts + '.' + body);
+  var verdictGood = verifyWebhookSignature_({
+    postData: { contents: body },
+    parameter: { _ts: ts, _sig: goodSig }
+  });
+  out.checks.push({
+    check: 'correctly-signed request accepted',
+    pass: verdictGood === '',
+    detail: verdictGood || 'accepted'
+  });
+
+  // --- 3. Confirm a wrong signature is actually rejected (verifier not inert) ---
+  var badVerdict = verifyWebhookSignature_({
+    postData: { contents: body },
+    parameter: { _ts: Math.floor(Date.now() / 1000).toString(), _sig: 'deadbeef'.repeat(8) }
+  });
+  out.checks.push({
+    check: 'tampered signature rejected',
+    pass: badVerdict === 'sig_mismatch',
+    detail: badVerdict
+  });
+
+  // --- 4. Freshness window the client must hit ---
+  out.timing = {
+    staleAfterSeconds: HMAC_STALE_SECS,
+    futureToleranceSeconds: HMAC_FUTURE_TOL,
+    serverUnixTime: Math.floor(Date.now() / 1000),
+    serverTimeIso: new Date().toISOString(),
+    note: 'A client clock off by more than these bounds is rejected as stale_ts/future_ts, NOT sig_mismatch.'
+  };
+
+  // --- 5. Is the rejection ongoing, or did it stop? ---
+  // Logging is throttled to one row per developer per 10 min, so treat these as
+  // a floor on the true rate, never an exact count.
+  var reasons = {};
+  var ages = { under15min: 0, under1h: 0, under6h: 0, under24h: 0, older: 0 };
+  var newestMs = 0;
+  var names = {};
+  try {
+    var appLog = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('AppLog');
+    if (appLog) {
+      var rows = getRecentLogRows_(appLog, 1000);
+      for (var i = 0; i < rows.length; i++) {
+        var msg = String(rows[i][1] || '');
+        if (msg.indexOf('doPost: signature rejected') !== 0) continue;
+        var m = msg.match(/—\s*(\w+)/);
+        var reason = m ? m[1] : 'unknown';
+        reasons[reason] = (reasons[reason] || 0) + 1;
+        var nm = msg.match(/for "([^"]+)"/);
+        if (nm) names[nm[1]] = true;
+        var ts2 = rows[i][0];
+        var tms = (ts2 && typeof ts2.getTime === 'function') ? ts2.getTime() : new Date(String(ts2)).getTime();
+        if (!isFinite(tms)) continue;
+        if (tms > newestMs) newestMs = tms;
+        var mins = (Date.now() - tms) / 60000;
+        if (mins < 15)        ages.under15min++;
+        else if (mins < 60)   ages.under1h++;
+        else if (mins < 360)  ages.under6h++;
+        else if (mins < 1440) ages.under24h++;
+        else                  ages.older++;
+      }
+    }
+  } catch (e) {}
+  out.rejectionHistory = {
+    byReason: reasons,
+    byAge: ages,
+    distinctDevelopersAffected: Object.keys(names).length,
+    minutesSinceNewestRejection: newestMs ? Math.round((Date.now() - newestMs) / 60000) : null,
+    caveat: 'Rejection logging is throttled per developer per 10 min — counts are a floor, not exact.'
+  };
+
+  // --- 6. Deployment identity ---
+  // The binary posts to a hard-coded URL. If that deployment is pinned to an
+  // older script version, the fleet is running code you are not editing.
+  out.deployment = {
+    scriptId: ScriptApp.getScriptId(),
+    webAppUrlOfThisDeployment: ScriptApp.getService().getUrl(),
+    urlCompiledIntoTheBinary: 'https://script.google.com/macros/s/AKfycby9bFBRwYLu1GF6urQn3saAuVacI95NjS2Jt2G3eiba3StKwu9i8POjXnlx224NMMXt/exec',
+    note: 'These two must be the SAME deployment, or your agents are executing a different pinned version than the one you deploy to.'
+  };
+
+  var serverSideOk = out.checks.every(function(c) { return c.pass; });
+  out.verdict = serverSideOk
+    ? 'SERVER-SIDE HMAC IS CORRECT — a properly signed request is accepted and a bad one rejected. ' +
+      'So sig_mismatch is coming from the client side or from something altering the request in transit ' +
+      '(check urlCompiledIntoTheBinary vs webAppUrlOfThisDeployment first).'
+    : 'SERVER-SIDE HMAC IS BROKEN — the verifier rejects even a correctly signed request. See checks[].';
+  return out;
+}
+
+function logSetupResult() {
+  Logger.log(JSON.stringify(setupUtilityDistribution(), null, 2));
+}
+
+function logRosterDuplicates() {
+  Logger.log(JSON.stringify(diagnoseRosterDuplicates(), null, 2));
+}
+
+// v5.1: DUPLICATE ROSTER ROWS.
+//
+// upsertRosterActivity_ deliberately takes no ScriptLock (a lock there would
+// starve getDashboardData), so two concurrent first-pings from the same machine
+// can each append a row. Separately, its lookup key is only
+// name.trim().toLowerCase() — so "Dhruv Patel" and "Dhruv_Patel" register as two
+// different people even though they are one human with one pair of Drive files.
+//
+// Effects: the registered-user count is inflated, activity is split across rows
+// so at least one always looks stale, and every duplicate counts again as a
+// separate non-reporting person in the compliance grid.
+//
+// This collapses separators and case the way the Drive filenames do, so it sees
+// the same identity the uploader does. READ-ONLY.
+function rosterIdentityKey_(name) {
+  return String(name || '').trim().toLowerCase().replace(/[\s_\-]+/g, '_');
+}
+
+function diagnoseRosterDuplicates() {
+  var sheet = ensureRegisteredDevelopersSheet();
+  var data = sheet.getDataRange().getValues();
+  var groups = {};
+
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || '').trim();
+    if (!name) continue;
+    var key = rosterIdentityKey_(name);
+    if (!groups[key]) groups[key] = [];
+    groups[key].push({
+      rowNumber: i + 1,
+      name: name,
+      registeredAt: stringifyCell_(data[i][1]),
+      lastSeen:     stringifyCell_(data[i][2]),
+      lastUpload:   stringifyCell_(data[i][5]),
+      version:      data[i][6] ? String(data[i][6]).trim() : '',
+      email:        data[i][REG_COL_EMAIL]  ? String(data[i][REG_COL_EMAIL]).trim()  : '',
+      system:       data[i][REG_COL_SYSTEM] ? String(data[i][REG_COL_SYSTEM]).trim() : '',
+      status:       normalizeUserStatus_(data[i][REG_COL_STATUS])
+    });
+  }
+
+  var duplicateGroups = [];
+  var totalRows = 0, distinctPeople = 0, redundantRows = 0;
+  Object.keys(groups).forEach(function(key) {
+    var g = groups[key];
+    totalRows += g.length;
+    distinctPeople++;
+    if (g.length > 1) {
+      redundantRows += g.length - 1;
+      // Distinct spellings are the useful signal — it tells you whether this is
+      // a write race (identical names) or name-form drift (different spellings).
+      var spellings = {};
+      g.forEach(function(r) { spellings[r.name] = true; });
+      duplicateGroups.push({
+        identity: key,
+        rowCount: g.length,
+        distinctSpellings: Object.keys(spellings),
+        likelyCause: Object.keys(spellings).length > 1
+          ? 'name-form drift (different spellings of one person)'
+          : 'concurrent write race (identical name appended twice)',
+        rows: g
+      });
+    }
+  });
+
+  duplicateGroups.sort(function(a, b) { return b.rowCount - a.rowCount; });
+
+  return {
+    verdict: redundantRows === 0
+      ? 'No duplicate roster rows. The registered count is trustworthy.'
+      : redundantRows + ' redundant row(s) across ' + duplicateGroups.length + ' person(ple). ' +
+        'True distinct people = ' + distinctPeople + ', not ' + totalRows + '. Run adminMergeRosterDuplicates() to fix.',
+    totalRosterRows: totalRows,
+    distinctPeople: distinctPeople,
+    redundantRows: redundantRows,
+    duplicateGroups: duplicateGroups
+  };
+}
+
+function stringifyCell_(v) {
+  if (!v) return '';
+  if (typeof v.getTime === 'function') return v.toISOString();
+  return String(v).trim();
+}
+
+// Collapses duplicate identities into one row, keeping the best value from each
+// column, then deletes the redundant rows. Snapshots the sheet to a hidden tab
+// first so the merge is reversible.
+//
+// DESTRUCTIVE — run diagnoseRosterDuplicates() first and read what it plans to
+// touch. Pass dryRun=true to see the merge plan without writing anything.
+function adminMergeRosterDuplicates(dryRun) {
+  requireAdmin_();
+  var report = { dryRun: !!dryRun, merged: [], rowsDeleted: 0, backupSheet: null };
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sheet = ensureRegisteredDevelopersSheet();
+    var data = sheet.getDataRange().getValues();
+
+    var groups = {};
+    for (var i = 1; i < data.length; i++) {
+      var name = String(data[i][0] || '').trim();
+      if (!name) continue;
+      var key = rosterIdentityKey_(name);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push({ rowNumber: i + 1, row: data[i] });
+    }
+
+    var dupKeys = Object.keys(groups).filter(function(k) { return groups[k].length > 1; });
+    if (dupKeys.length === 0) {
+      report.verdict = 'Nothing to merge — no duplicate identities found.';
+      return report;
+    }
+
+    if (!dryRun) {
+      try {
+        var parent = sheet.getParent();
+        var backupName = 'RegisteredDevelopers_predupe_' +
+          Utilities.formatDate(new Date(), 'UTC', 'yyyyMMdd_HHmmss');
+        sheet.copyTo(parent).setName(backupName).hideSheet();
+        report.backupSheet = backupName;
+      } catch (e) {
+        // Refuse to run destructively without a snapshot.
+        report.verdict = 'ABORTED — could not create the safety snapshot: ' + e.toString();
+        return report;
+      }
+    }
+
+    function ms(v) {
+      if (!v) return 0;
+      if (typeof v.getTime === 'function') return v.getTime();
+      var t = new Date(String(v)).getTime();
+      return isFinite(t) ? t : 0;
+    }
+    function newest(rows, idx) {
+      var best = '', bestMs = 0;
+      rows.forEach(function(r) {
+        var m = ms(r.row[idx]);
+        if (m > bestMs) { bestMs = m; best = stringifyCell_(r.row[idx]); }
+      });
+      return best;
+    }
+    function oldest(rows, idx) {
+      var best = '', bestMs = Infinity;
+      rows.forEach(function(r) {
+        var m = ms(r.row[idx]);
+        if (m > 0 && m < bestMs) { bestMs = m; best = stringifyCell_(r.row[idx]); }
+      });
+      return best;
+    }
+    function firstNonEmpty(rows, idx) {
+      for (var k = 0; k < rows.length; k++) {
+        var v = rows[k].row[idx];
+        if (v !== null && v !== undefined && String(v).trim() !== '') return String(v).trim();
+      }
+      return '';
+    }
+
+    var deletions = [];
+    dupKeys.forEach(function(key) {
+      var g = groups[key];
+      // Canonical name: prefer the underscore form the uploader actually sends,
+      // since that is what the Drive filenames and incoming pings use.
+      var canonical = g[0].row[0];
+      for (var k = 0; k < g.length; k++) {
+        if (String(g[k].row[0]).indexOf('_') !== -1) { canonical = g[k].row[0]; break; }
+      }
+      // Keep the row with the newest LastSeen — least likely to be the orphan.
+      var keeper = g[0];
+      g.forEach(function(r) { if (ms(r.row[2]) > ms(keeper.row[2])) keeper = r; });
+
+      // A Removed/Paused marking on ANY duplicate must survive the merge —
+      // silently reactivating a removed person would be the worst outcome here.
+      var statuses = g.map(function(r) { return normalizeUserStatus_(r.row[REG_COL_STATUS]); });
+      var mergedStatus = statuses.indexOf(USER_STATUS.REMOVED) !== -1 ? USER_STATUS.REMOVED
+                       : statuses.indexOf(USER_STATUS.PAUSED)  !== -1 ? USER_STATUS.PAUSED
+                       : USER_STATUS.ACTIVE;
+
+      var mergedRow = [
+        String(canonical).trim(),
+        oldest(g, 1) || new Date().toISOString(), // RegisteredAt — earliest wins
+        newest(g, 2),                             // LastSeen
+        newest(g, 3),                             // LastHeartbeat
+        newest(g, 4),                             // LastPong
+        newest(g, 5),                             // LastUpload
+        firstNonEmpty(g, 6),                      // Version
+        newest(g, 7),                             // NextPollAt
+        newest(g, 8),                             // LastUpdateCheck
+        firstNonEmpty(g, REG_COL_EMAIL),
+        firstNonEmpty(g, REG_COL_SYSTEM),
+        mergedStatus,
+        newest(g, REG_COL_REMOVED)
+      ];
+
+      report.merged.push({
+        identity: key,
+        canonicalName: mergedRow[0],
+        collapsedFrom: g.map(function(r) { return { row: r.rowNumber, name: String(r.row[0]).trim() }; }),
+        keptRow: keeper.rowNumber,
+        mergedStatus: mergedStatus,
+        mergedLastUpload: mergedRow[5]
+      });
+
+      if (!dryRun) {
+        sheet.getRange(keeper.rowNumber, 1, 1, REG_SHEET_HEADERS.length).setValues([mergedRow]);
+        g.forEach(function(r) {
+          if (r.rowNumber !== keeper.rowNumber) deletions.push(r.rowNumber);
+        });
+      }
+    });
+
+    if (!dryRun && deletions.length > 0) {
+      // Delete bottom-up so earlier row numbers stay valid as rows shift.
+      deletions.sort(function(a, b) { return b - a; });
+      deletions.forEach(function(rowNum) { sheet.deleteRow(rowNum); });
+      report.rowsDeleted = deletions.length;
+      SpreadsheetApp.flush();
+      invalidateCache_();
+      log_('Roster dedupe: merged ' + report.merged.length + ' identity(ies), deleted ' +
+           report.rowsDeleted + ' redundant row(s). Backup: ' + report.backupSheet);
+    }
+
+    report.verdict = dryRun
+      ? 'DRY RUN — nothing written. ' + report.merged.length + ' identity(ies) would collapse, ' +
+        'removing ' + (report.merged.reduce(function(s, m) { return s + m.collapsedFrom.length - 1; }, 0)) + ' row(s).'
+      : 'Merged ' + report.merged.length + ' identity(ies) and deleted ' + report.rowsDeleted +
+        ' row(s). Snapshot saved as hidden sheet "' + report.backupSheet + '".';
+    return report;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function logRosterDedupePlan() {
+  Logger.log(JSON.stringify(adminMergeRosterDuplicates(true), null, 2));
+}
+
+// v5.1: names-only fleet summary. diagnoseDriveVsRoster returns a full record
+// per user, which Apps Script truncates well before the end of a 76-person
+// roster — so the rows that matter most (the never-uploaded tail) were exactly
+// the ones being cut off. This prints just the names, grouped, so nothing is lost.
+function logFleetSummary() {
+  var d = diagnoseDriveVsRoster();
+  if (d.error) { Logger.log(d.error); return; }
+
+  var byState = { DRIVE_NEWER_THAN_ROSTER: [], NO_DRIVE_FILE: [], IN_SYNC: [] };
+  (d.users || []).forEach(function(u) {
+    if (byState[u.state]) byState[u.state].push(u.name);
+  });
+
+  var lines = [];
+  lines.push('FLEET SUMMARY  (' + d.summary.rosterUsers + ' active roster users, ' +
+             d.summary.driveFilePairsFound + ' with report files in Drive)');
+  lines.push('');
+  lines.push('UPLOADING BUT ROSTER STALE — ' + d.summary.driveNewerThanRoster + ' (treat as COMPLIANT):');
+  lines.push('  ' + (byState.DRIVE_NEWER_THAN_ROSTER.join(', ') || 'none'));
+  lines.push('');
+  lines.push('NEVER UPLOADED — ' + d.summary.noDriveFileAtAll + ' (install likely never completed):');
+  lines.push('  ' + (byState.NO_DRIVE_FILE.join(', ') || 'none'));
+  lines.push('');
+  lines.push('ROSTER AGREES WITH DRIVE — ' + d.summary.rosterMatchesDrive +
+             ' (accurate; includes long-inactive users)');
+  lines.push('');
+
+  // Obvious non-humans left in the roster skew every compliance percentage.
+  var suspects = [];
+  var reNonHuman = /(^|_)(admin|test|testing|demo|sample|dummy|final)(_|$)/i;
+  (d.users || []).forEach(function(u) {
+    if (u.state === 'NO_DRIVE_FILE' && reNonHuman.test(u.name)) suspects.push(u.name);
+  });
+  if (suspects.length > 0) {
+    lines.push('LIKELY TEST/NON-HUMAN ENTRIES — ' + suspects.length + ':');
+    lines.push('  ' + suspects.join(', '));
+    lines.push('  These inflate the compliance denominator. Remove them from the Users page.');
+    lines.push('');
+  }
+
+  lines.push('Reminder: LastUpload comes from the webhook SUCCESS ping, Drive mtimes come');
+  lines.push('from the files themselves. While signatures are being rejected, Drive is the');
+  lines.push('only trustworthy record of who is actually reporting.');
+
+  Logger.log(lines.join('\n'));
+}
+
+function logRosterDedupeApply() {
+  Logger.log(JSON.stringify(adminMergeRosterDuplicates(false), null, 2));
+}
+
+// Confirms what the dashboard believes about distribution + digest config,
+// without changing anything. Useful right after a setup run.
+function logCurrentConfig() {
+  Logger.log(JSON.stringify({
+    downloadConfig:   getUtilityDownloadConfig(),
+    digestConfig:     getWeeklyDigestConfig(),
+    adminAllowlist:   getAdminAllowlistInfo(),
+    uploadSchedule:   getUploadSchedule_(),
+    schemaInfo:       getSchemaInfo()
+  }, null, 2));
 }

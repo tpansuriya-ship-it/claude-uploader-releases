@@ -1,4 +1,4 @@
-{
+﻿{
   "bin": "claude-usage-uploader.js",
   "dependencies": {
     "node-fetch": "2.7.0"
@@ -6,10 +6,10 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "prepare-tools": "node scripts/prepare-vendor-tools.js",
-    "build-win": "pkg . --target node22-win-x64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.5/ClaudeUsageUploader_v2.0.5-win-x64.exe",
-    "build-mac-x64": "pkg . --target node22-macos-x64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.5/ClaudeUsageUploader_v2.0.5-macos-x64",
-    "build-mac-arm64": "pkg . --target node22-macos-arm64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.5/ClaudeUsageUploader_v2.0.5-macos-arm64",
-    "build-linux": "pkg . --target node22-linux-x64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.5/ClaudeUsageUploader_v2.0.5-linux-x64"
+    "build-win": "pkg . --target node22-win-x64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.6/ClaudeUsageUploader_v2.0.6-win-x64.exe",
+    "build-mac-x64": "pkg . --target node22-macos-x64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.6/ClaudeUsageUploader_v2.0.6-macos-x64",
+    "build-mac-arm64": "pkg . --target node22-macos-arm64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.6/ClaudeUsageUploader_v2.0.6-macos-arm64",
+    "build-linux": "pkg . --target node22-linux-x64 --options no-warnings --no-bytecode --public --public-packages \"*\" --output dist/2.0.6/ClaudeUsageUploader_v2.0.6-linux-x64"
   },
   "devDependencies": {
     "@google/clasp": "3.3.0",

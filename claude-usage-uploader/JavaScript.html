@@ -46,7 +46,14 @@ function navigateTo(page) {
 function renderPageData(page) {
   if (page === 'overview')    renderOverviewKpis();
   if (page === 'compliance')  renderCompliancePage();
-  if (page === 'developers')  renderDevRoster();
+  if (page === 'developers') {
+    renderDevRoster();
+    // v5: version-drift preview for the mass reminder card. Fetched on demand
+    // rather than bundled into the dashboard payload — it is only ever read on
+    // this page, and keeping it out keeps the cached payload small.
+    loadReminderPreview();
+    loadDownloadUrls();
+  }
   if (page === 'versions')    renderVersionMatrix();
   if (page === 'health')      renderHealthKpis();
   if (page === 'queue') {
@@ -130,6 +137,22 @@ function getStatusDotHtml(user) {
 
 // v3: isSilent=true refreshes data in the background — no button spinner, no
 // full-screen loader, and the DOM is patched in-place so expanded progress
+// v5: single choke point for payload shaping.
+//
+// `activeUsers` is the raw roster and therefore includes soft-removed users
+// (they keep their row for the retention window). Every existing consumer —
+// the Overview presence table, the online/offline KPIs, the Version Matrix,
+// runOnline(), the force-run dropdown — treats that array as "the live fleet",
+// so removed users are stripped here rather than at each call site. The full
+// list stays reachable as `allUsers` for anything that genuinely needs it.
+function normalizePayload(res) {
+  if (!res || !res.activeUsers) return res || {};
+  var all = res.activeUsers;
+  res.allUsers = all;
+  res.activeUsers = all.filter(function(u) { return u.status !== 'Removed'; });
+  return res;
+}
+
 // rows, scroll positions and filters survive. Manual refreshes stay "loud".
 function fetchData(isSilent) {
   var rb = document.getElementById('refreshBtn');
@@ -138,7 +161,7 @@ function fetchData(isSilent) {
   }
   google.script.run.withSuccessHandler(function(res) {
     try {
-      dashboardData = res;
+      dashboardData = normalizePayload(res);
       if (isSilent && document.getElementById('appShell').style.display !== 'none') {
         updateDashboardInPlace();
       } else {
@@ -320,11 +343,16 @@ function renderUploadSummaryAndQueue() {
   const { registeredDevelopers=[], complianceByWeek={}, activeUsers=[], triggerQueue=[] } = dashboardData;
   const registeredNames = registeredDevelopers.map(r => r.name);
   const adminTriggers = triggerQueue.map(t => ({ devName: t.name, timestamp: t.queuedAt, notBefore: t.notBefore || '', type: t.type }));
-  // Queue dropdown: registered developers + any active users not yet in registered list
+  // Queue dropdown: registered developers + any active users not yet in registered list.
+  // v5: registeredDevelopers already excludes removed users, but activeUsers does
+  // not — filter them out here too, or a removed user would remain force-runnable.
   const registeredNameSet = new Set(registeredNames);
   const adminUsers = [...new Set([
     ...registeredNames,
-    ...(activeUsers || []).map(u => u.name).filter(n => !registeredNameSet.has(n))
+    ...(activeUsers || [])
+      .filter(u => u.status !== 'Removed')
+      .map(u => u.name)
+      .filter(n => !registeredNameSet.has(n))
   ])];
 
   // Upload Summary
@@ -992,19 +1020,308 @@ function renderProgressHtml(name, res) {
 // Manage Developers \u2014 v3: Expected-roster chip lists removed; the Registered
 // Users table + CSV reconciliation card are the only roster surfaces.
 
-function addRegisteredDeveloperManual() {
-  const inp = document.getElementById('newRegDevName');
-  const val = inp.value.trim();
-  if (!val) return;
-  inp.disabled = true;
+// ==================== v5: USER MANAGEMENT ====================
+
+function toggleSection(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('open');
+  // Populate the distribution panel lazily, the first time it is opened.
+  if (id === 'utilDistBody' && el.classList.contains('open')) {
+    loadDownloadUrls();
+    loadEmailTemplateEditor();
+  }
+}
+
+function toggleAddUserEmailFields() {
+  const cb = document.getElementById('newRegDevSendEmail');
+  const box = document.getElementById('addUserEmailFields');
+  if (!cb || !box) return;
+  box.classList.toggle('open', cb.checked);
+}
+
+function submitAddUser() {
+  const nameEl   = document.getElementById('newRegDevName');
+  const emailEl  = document.getElementById('newRegDevEmail');
+  const sysEl    = document.getElementById('newRegDevSystem');
+  const sendEl   = document.getElementById('newRegDevSendEmail');
+  const subjEl   = document.getElementById('newRegDevSubject');
+  const bodyEl   = document.getElementById('newRegDevBody');
+  const btn      = document.getElementById('addUserBtn');
+  const msg      = document.getElementById('addUserMsg');
+
+  const name = (nameEl.value || '').trim();
+  if (!name) { showToast('Name is required', true); nameEl.focus(); return; }
+
+  const email = (emailEl.value || '').trim();
+  const sendEmail = !!(sendEl && sendEl.checked);
+  if (sendEmail && !email) {
+    showToast('An email address is required to send the setup email', true);
+    emailEl.focus();
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  if (msg) msg.textContent = '';
+
   google.script.run
     .withSuccessHandler(function(res) {
-      inp.disabled = false; inp.value = '';
-      if (res.success) { showToast('Developer registered'); fetchData(); }
-      else showToast('Error: ' + res.error, true);
+      btn.disabled = false;
+      btn.textContent = '+ Add User';
+      if (!res.success) {
+        showToast('Error: ' + res.error, true);
+        if (msg) {
+          msg.innerHTML = res.canRestore
+            ? '<span style="color:var(--amber)">' + esc(res.error) + '</span>'
+            : '';
+        }
+        return;
+      }
+      nameEl.value = '';
+      emailEl.value = '';
+      if (subjEl) subjEl.value = '';
+      if (bodyEl) bodyEl.value = '';
+      if (sendEl) { sendEl.checked = false; toggleAddUserEmailFields(); }
+
+      if (sendEmail && res.emailSent) {
+        showToast('User added and setup email sent');
+      } else if (sendEmail && !res.emailSent) {
+        // Registration succeeded but the mail did not — say so explicitly
+        // rather than reporting a blanket success.
+        showToast('User added, but the email failed: ' + (res.emailError || 'unknown'), true);
+        if (msg) msg.innerHTML = '<span style="color:var(--red)">Email failed: ' + esc(res.emailError || 'unknown') + '</span>';
+      } else {
+        showToast('User added');
+      }
+      fetchData();
     })
-    .withFailureHandler(function(err) { inp.disabled = false; showToast('Failed: ' + err.message, true); })
-    .addRegisteredDeveloper(val);
+    .withFailureHandler(function(err) {
+      btn.disabled = false;
+      btn.textContent = '+ Add User';
+      showToast('Failed: ' + err.message, true);
+    })
+    .adminAddUser({
+      name:         name,
+      email:        email,
+      system:       sysEl ? sysEl.value : '',
+      sendEmail:    sendEmail,
+      emailSubject: (sendEmail && subjEl) ? (subjEl.value || '').trim() : '',
+      emailBody:    (sendEmail && bodyEl) ? (bodyEl.value || '').trim() : ''
+    });
+}
+
+// Backward-compatible alias for dashboard HTML cached from earlier deployments.
+function addRegisteredDeveloperManual() { submitAddUser(); }
+
+// Copy a saved template into the Add-User override fields so the admin can
+// tweak one message without editing the stored default.
+function loadEmailTemplateInto(kind) {
+  const subjEl = document.getElementById('newRegDevSubject');
+  const bodyEl = document.getElementById('newRegDevBody');
+  const sendEl = document.getElementById('newRegDevSendEmail');
+  if (sendEl && !sendEl.checked) { sendEl.checked = true; toggleAddUserEmailFields(); }
+  google.script.run
+    .withSuccessHandler(function(tpls) {
+      const t = tpls[kind];
+      if (!t) return;
+      if (subjEl) subjEl.value = t.subject;
+      if (bodyEl) bodyEl.value = t.body;
+      showToast('Template loaded — edit freely, it will not overwrite the saved one');
+    })
+    .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+    .getEmailTemplates();
+}
+
+// -------- Download URL configuration --------
+
+function loadDownloadUrls() {
+  const cfg = (dashboardData && dashboardData.utilityDownload) || null;
+  if (!cfg || !cfg.urls) return;
+  const map = { windows: 'dlUrlWindows', macos: 'dlUrlMacos', linux: 'dlUrlLinux' };
+  Object.keys(map).forEach(function(platform) {
+    const el = document.getElementById(map[platform]);
+    if (el && !el.value) el.value = cfg.urls[platform] || '';
+  });
+  const verEl = document.getElementById('utilLatestVersion');
+  if (verEl) verEl.textContent = 'v' + (cfg.latestVersion || '—');
+}
+
+function saveDownloadUrls() {
+  const msg = document.getElementById('dlUrlMsg');
+  const payload = {
+    windows: (document.getElementById('dlUrlWindows').value || '').trim(),
+    macos:   (document.getElementById('dlUrlMacos').value   || '').trim(),
+    linux:   (document.getElementById('dlUrlLinux').value   || '').trim()
+  };
+  if (msg) msg.textContent = 'Saving…';
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (res.success) {
+        if (msg) msg.innerHTML = '<span style="color:var(--green)">Saved</span>';
+        showToast('Download URLs saved');
+        fetchData();
+      } else {
+        if (msg) msg.innerHTML = '<span style="color:var(--red)">' + esc(res.error || 'Failed') + '</span>';
+      }
+    })
+    .withFailureHandler(function(err) {
+      if (msg) msg.innerHTML = '<span style="color:var(--red)">' + esc(err.message) + '</span>';
+      showToast('Failed: ' + err.message, true);
+    })
+    .setUtilityDownloadConfig(payload);
+}
+
+// -------- Email template editor --------
+
+let _emailTemplates = null;
+
+function loadEmailTemplateEditor() {
+  const kind = document.getElementById('tplKind').value;
+  const apply = function(tpls) {
+    _emailTemplates = tpls;
+    const t = tpls[kind];
+    if (!t) return;
+    document.getElementById('tplSubject').value = t.subject;
+    document.getElementById('tplBody').value = t.body;
+    const msg = document.getElementById('tplMsg');
+    if (msg) {
+      msg.innerHTML = t.isCustom
+        ? '<span style="color:var(--indigo)">Using a customised template</span>'
+        : '<span style="color:var(--t3)">Using the built-in default</span>';
+    }
+  };
+  if (_emailTemplates) { apply(_emailTemplates); return; }
+  google.script.run
+    .withSuccessHandler(apply)
+    .withFailureHandler(function(err) { showToast('Failed to load templates: ' + err.message, true); })
+    .getEmailTemplates();
+}
+
+function saveEmailTemplate() {
+  const kind = document.getElementById('tplKind').value;
+  const subject = (document.getElementById('tplSubject').value || '').trim();
+  const body    = (document.getElementById('tplBody').value || '').trim();
+  const msg     = document.getElementById('tplMsg');
+  if (!subject || !body) { showToast('Subject and body are both required', true); return; }
+  if (msg) msg.textContent = 'Saving…';
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (res.success) {
+        _emailTemplates = null; // force a reload so isCustom refreshes
+        loadEmailTemplateEditor();
+        showToast('Template saved');
+      } else {
+        if (msg) msg.innerHTML = '<span style="color:var(--red)">' + esc(res.error) + '</span>';
+      }
+    })
+    .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+    .setEmailTemplate(kind, subject, body);
+}
+
+function resetEmailTemplateUi() {
+  const kind = document.getElementById('tplKind').value;
+  showConfirm('Reset the <strong>' + esc(kind) + '</strong> email template to its built-in default?', 'Reset', function() {
+    google.script.run
+      .withSuccessHandler(function(res) {
+        if (res.success) {
+          _emailTemplates = null;
+          loadEmailTemplateEditor();
+          showToast('Template reset to default');
+        } else showToast('Error: ' + res.error, true);
+      })
+      .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+      .resetEmailTemplate(kind);
+  });
+}
+
+// -------- Mass update reminder (Requirement 4) --------
+
+function loadReminderPreview() {
+  const box = document.getElementById('reminderPreview');
+  if (!box) return;
+  box.innerHTML = '<div class="empty-state">Checking version drift…</div>';
+  google.script.run
+    .withSuccessHandler(renderReminderPreview)
+    .withFailureHandler(function(err) {
+      box.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed: ' + esc(err.message) + '</div>';
+    })
+    .getUpdateReminderPreview();
+}
+
+function renderReminderPreview(p) {
+  const box = document.getElementById('reminderPreview');
+  if (!box) return;
+
+  if (p.outdatedCount === 0) {
+    box.innerHTML = '<div class="empty-state" style="color:var(--green)">' +
+      'Every active user is already on v' + esc(p.latestVersion) + '. Nothing to send.</div>';
+    return;
+  }
+
+  let warn = '';
+  if (!p.downloadConfigured) {
+    warn = '<div style="padding:10px 12px;margin-bottom:12px;border-radius:8px;' +
+      'background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);font-size:12px;color:var(--red)">' +
+      '<b>No download URL configured.</b> Reminder emails will be skipped until you set one in Utility Distribution above.</div>';
+  }
+
+  const reachRows = (p.reachable || []).map(function(u) {
+    return '<tr><td style="font-weight:600">' + esc(u.name) + '</td>' +
+      '<td><span class="badge b-amber" style="font-family:monospace">v' + esc(u.version) + '</span></td>' +
+      '<td style="font-size:12px;color:var(--t2)">' + esc(u.email) + '</td>' +
+      '<td style="font-size:12px;color:var(--t3)">' + esc(u.system || 'not set') + '</td></tr>';
+  }).join('');
+
+  const unreachRows = (p.unreachable || []).map(function(u) {
+    return '<tr><td style="font-weight:600">' + esc(u.name) + '</td>' +
+      '<td><span class="badge b-amber" style="font-family:monospace">v' + esc(u.version) + '</span></td>' +
+      '<td colspan="2"><span style="color:var(--amber);font-size:12px">No email on file &#8212; add one via Edit on the roster</span></td></tr>';
+  }).join('');
+
+  const canSend = (p.reachable || []).length > 0 && p.downloadConfigured;
+
+  box.innerHTML = warn +
+    '<div class="kpi-strip" style="margin-bottom:14px">' +
+      '<div class="kpi-card"><div class="kpi-val sv-amber">' + p.outdatedCount + '</div><div class="kpi-label">Outdated users</div></div>' +
+      '<div class="kpi-card"><div class="kpi-val sv-green">' + (p.reachable || []).length + '</div><div class="kpi-label">Will be emailed</div></div>' +
+      '<div class="kpi-card"><div class="kpi-val ' + ((p.unreachable || []).length ? 'sv-red' : 'sv-green') + '">' + (p.unreachable || []).length + '</div><div class="kpi-label">No email on file</div></div>' +
+    '</div>' +
+    '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+      '<th>Name</th><th>Version</th><th>Email</th><th>System</th>' +
+    '</tr></thead><tbody>' + reachRows + unreachRows + '</tbody></table></div>' +
+    '<div class="u-actions">' +
+      '<button class="btn btn-primary btn-sm" id="sendReminderBtn" onclick="sendMassReminder()"' +
+        (canSend ? '' : ' disabled') + '>&#9993; Send reminder to ' + (p.reachable || []).length + ' user(s)</button>' +
+      '<span class="u-hint">Uses the "Update reminder (mass)" template. Latest release: v' + esc(p.latestVersion) + '</span>' +
+    '</div>';
+}
+
+function sendMassReminder() {
+  const btn = document.getElementById('sendReminderBtn');
+  showConfirm(
+    'Send the update reminder email to every active user running an outdated version?' +
+    '<br><br><span style="color:var(--t3);font-size:12px">Users with no email address on file are skipped.</span>',
+    'Send emails',
+    function() {
+      if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+      google.script.run
+        .withSuccessHandler(function(res) {
+          if (!res.success) {
+            showToast('Error: ' + (res.error || 'unknown'), true);
+            if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+            return;
+          }
+          showToast(res.sent + ' reminder(s) sent' + (res.skipped ? ', ' + res.skipped + ' skipped' : ''));
+          loadReminderPreview();
+        })
+        .withFailureHandler(function(err) {
+          showToast('Failed: ' + err.message, true);
+          if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+        })
+        .sendUpdateReminderEmails(null, 'reminder', '', '');
+    }
+  );
 }
 
 // v3: generic confirmation modal. Replaces the old persistent confirmOkBtn
@@ -1415,26 +1732,122 @@ document.addEventListener('click', function(e) {
     togglePause(name, isPaused);
   } else if (btn.classList.contains('js-remove-reg-dev')) {
     e.stopPropagation();
+    // v5: removal is now reversible and non-destructive — the reports survive
+    // the retention window. The copy reflects that so admins stop treating
+    // Delete as a last resort.
+    var retention = dashboardData.removedRetentionDays || 120;
     showConfirm(
-      'Are you sure you want to remove <strong>' + esc(name) + '</strong>?<br><br>' +
-      '<span style="color:var(--red);font-weight:700">Warning:</span> This deletes their registration and ' +
-      'permanently removes their JSON reports from the shared Drive folder.',
-      'Delete',
+      'Remove <strong>' + esc(name) + '</strong> from the utility portal?<br><br>' +
+      'Their uploader stops reporting immediately, and they are moved to the ' +
+      '<strong>Removed Users</strong> list.<br><br>' +
+      '<span style="color:var(--t3);font-size:12px">Their uploaded reports stay available for ' +
+      retention + ' days, then purge automatically. You can restore them at any point before that.</span>',
+      'Remove user',
       function() {
         google.script.run
           .withSuccessHandler(function(r) {
-            if (r.success) { showToast('Developer and Drive files removed'); fetchData(); }
-            else showToast('Error: ' + (r.error || 'Unknown'), true);
+            if (r.success) {
+              showToast(name + ' removed — reports retained for ' + (r.retentionDays || retention) + ' days');
+              fetchData();
+            } else showToast('Error: ' + (r.error || 'Unknown'), true);
           })
           .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
           .removeRegisteredDeveloper(name);
       }
     );
+  } else if (btn.classList.contains('js-restore-user')) {
+    e.stopPropagation();
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r.success) { showToast(name + ' restored'); fetchData(); }
+        else showToast('Error: ' + (r.error || 'Unknown'), true);
+      })
+      .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+      .adminRestoreUser(name);
+  } else if (btn.classList.contains('js-purge-user')) {
+    e.stopPropagation();
+    showConfirm(
+      'Purge <strong>' + esc(name) + '</strong> now?<br><br>' +
+      '<span style="color:var(--red);font-weight:700">This cannot be undone.</span> Their roster row is ' +
+      'deleted and their JSON reports are trashed in the shared Drive folder immediately, ' +
+      'without waiting out the retention window.',
+      'Purge permanently',
+      function() {
+        google.script.run
+          .withSuccessHandler(function(r) {
+            if (r.success) {
+              showToast(name + ' purged (' + (r.driveFilesDeleted || 0) + ' file(s) trashed)');
+              fetchData();
+            } else showToast('Error: ' + (r.error || 'Unknown'), true);
+          })
+          .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+          .adminHardDeleteUser(name);
+      }
+    );
+  } else if (btn.classList.contains('js-email-setup')) {
+    e.stopPropagation();
+    showConfirm(
+      'Email <strong>' + esc(name) + '</strong> the current utility download link?<br><br>' +
+      '<span style="color:var(--t3);font-size:12px">Uses the saved "Setup / onboarding" template.</span>',
+      'Send email',
+      function() {
+        google.script.run
+          .withSuccessHandler(function(r) {
+            if (r.success) showToast('Email sent to ' + name);
+            else showToast('Not sent: ' + (r.error || 'Unknown'), true);
+          })
+          .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+          .sendSetupEmailToUser(name, '', '');
+      }
+    );
+  } else if (btn.classList.contains('js-edit-user')) {
+    e.stopPropagation();
+    openEditUser(name, btn.dataset.email || '', btn.dataset.system || '');
   } else if (btn.classList.contains('js-recon-register')) {
     e.stopPropagation();
     registerReconDev(name);
   }
 });
+
+// v5: inline edit for a user's Email / System. Reuses the confirm modal shell
+// so no new overlay markup is needed.
+function openEditUser(name, email, system) {
+  var cfg = (dashboardData && dashboardData.utilityDownload) || {};
+  var opts = cfg.systemOptions || [];
+  var optionHtml = '<option value="">Not specified</option>' + opts.map(function(o) {
+    return '<option value="' + esc(o.value) + '"' + (o.value === system ? ' selected' : '') + '>' + esc(o.value) + '</option>';
+  }).join('');
+
+  showConfirm(
+    '<div style="text-align:left">' +
+      '<div style="font-weight:600;margin-bottom:12px">Edit ' + esc(name) + '</div>' +
+      '<div class="u-field" style="margin-bottom:12px">' +
+        '<label class="u-label" for="editUserEmail">Email address</label>' +
+        '<input type="email" id="editUserEmail" value="' + esc(email) + '" placeholder="name@sigmasolve.com">' +
+      '</div>' +
+      '<div class="u-field">' +
+        '<label class="u-label" for="editUserSystem">System</label>' +
+        '<select id="editUserSystem">' + optionHtml + '</select>' +
+      '</div>' +
+    '</div>',
+    'Save',
+    function() {
+      // closeConfirm() only hides the overlay — it does not clear confirmMsg —
+      // so these inputs are still in the DOM when this callback runs.
+      var emailEl = document.getElementById('editUserEmail');
+      var sysEl   = document.getElementById('editUserSystem');
+      var newEmail  = emailEl ? (emailEl.value || '').trim() : '';
+      var newSystem = sysEl ? sysEl.value : '';
+      google.script.run
+        .withSuccessHandler(function(r) {
+          if (r.success) { showToast('Updated ' + name); fetchData(); }
+          else showToast('Error: ' + (r.error || 'Unknown'), true);
+        })
+        .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
+        .adminUpdateUser(name, { email: newEmail, system: newSystem });
+    }
+  );
+}
 
 document.addEventListener('input', function(e) {
   if (e.target.id !== 'activeUsersSearch') return;
@@ -1650,14 +2063,36 @@ function renderDevRoster() {
   const kpiContainer = document.getElementById('developersKpis');
   if (!tbody) return;
 
+  // v5: keep the dependent Users-page widgets in sync with every roster render.
+  try { populateSystemOptions(); } catch (e) {}
+  try { renderRemovedUsers(); } catch (e) {}
+
   // Count KPI totals
   let onlineCount  = 0;
   let offlineCount = 0;
   let stalledCount = 0;
+  let pausedCount  = 0;
 
   const rosterRows = registeredDevelopers.map(function(reg) {
     const name    = reg.name || reg;
     const activeU = activeUsers.find(function(u) { return u.name === name; }) || {};
+
+    // v5: lifecycle status. Every user who is neither paused nor removed reads
+    // as Active — including users who have never pinged, since "Active" is an
+    // administrative state, not a liveness signal (that is the next column).
+    const status = activeU.status || reg.status || 'Active';
+    if (status === 'Paused') pausedCount++;
+    const statusBadge = status === 'Paused'
+      ? '<span class="badge b-amber">Paused</span>'
+      : '<span class="badge b-green">Active</span>';
+
+    // Email / System — the two fields the setup and reminder mails depend on.
+    const email  = activeU.email  || reg.email  || '';
+    const system = activeU.system || reg.system || '';
+    const emailHtml = email
+      ? `<span style="font-size:12px;color:var(--t2)">${esc(email)}</span>`
+      : `<span style="font-size:12px;color:var(--amber)" title="No email on file — this user cannot be sent setup or reminder mail">No email</span>`;
+    const contactHtml = `${emailHtml}<br><span style="font-size:11px;color:var(--t3)">${system ? esc(system) : 'System not set'}</span>`;
 
     // Version badge
     const ver = activeU.version || '\u2014';
@@ -1705,6 +2140,8 @@ function renderDevRoster() {
 
     return `<tr data-user="${esc(name)}">
       <td style="font-weight:600">${esc(name)}</td>
+      <td>${statusBadge}</td>
+      <td>${contactHtml}</td>
       <td><div class="status-cell">${statusHtml}</div></td>
       <td>${lastSeenHtml}</td>
       <td>${lastUploadHtml}</td>
@@ -1715,6 +2152,9 @@ function renderDevRoster() {
             ${activeU.pendingTrigger ? '&#9203; Queued' : '&#9654; Generate'}
           </button>
           ${pauseBtnHtml}
+          <button class="btn btn-ghost btn-sm js-edit-user" data-name="${esc(name)}"
+                  data-email="${esc(email)}" data-system="${esc(system)}">&#9998; Edit</button>
+          <button class="btn btn-cyan btn-sm js-email-setup" data-name="${esc(name)}" ${email ? '' : 'disabled title="No email on file"'}>&#9993; Email</button>
           <button class="btn btn-red btn-sm js-remove-reg-dev" data-name="${esc(name)}">&#128465; Delete</button>
           <button class="btn btn-ghost btn-sm js-show-logs" data-name="${esc(name)}">Logs</button>
         </div>
@@ -1724,17 +2164,84 @@ function renderDevRoster() {
 
   // Render KPI strip
   if (kpiContainer) {
+    const removedCount = (dashboardData.removedUsers || []).length;
     kpiContainer.innerHTML = `
-      <div class="kpi-card"><div class="kpi-val sv-indigo">${registeredDevelopers.length}</div><div class="kpi-label">Registered Devs</div></div>
+      <div class="kpi-card"><div class="kpi-val sv-indigo">${registeredDevelopers.length}</div><div class="kpi-label">Active Users</div></div>
       <div class="kpi-card"><div class="kpi-val sv-green">${onlineCount}</div><div class="kpi-label">Online Now</div></div>
       <div class="kpi-card"><div class="kpi-val sv-amber">${offlineCount}</div><div class="kpi-label">Offline</div></div>
       <div class="kpi-card"><div class="kpi-val ${stalledCount > 0 ? 'sv-red' : 'sv-green'}">${stalledCount}</div><div class="kpi-label">Stalled (&gt;24h)</div></div>
+      <div class="kpi-card"><div class="kpi-val ${pausedCount > 0 ? 'sv-amber' : 'sv-green'}">${pausedCount}</div><div class="kpi-label">Paused</div></div>
+      <div class="kpi-card"><div class="kpi-val sv-indigo">${removedCount}</div><div class="kpi-label">Removed (retained)</div></div>
     `;
   }
 
   tbody.innerHTML = rosterRows.length
     ? rosterRows.join('')
-    : '<tr><td colspan="6" class="empty-state">No registered developers found.</td></tr>';
+    : '<tr><td colspan="8" class="empty-state">No active users found.</td></tr>';
+}
+
+// v5: removed users still inside their retention window. Hidden entirely when
+// there are none, so the page stays clean in the common case.
+function renderRemovedUsers() {
+  const removed = dashboardData.removedUsers || [];
+  const card  = document.getElementById('removedUsersCard');
+  const tbody = document.getElementById('removedUsersTbody');
+  const sub   = document.getElementById('removedUsersSub');
+  if (!card || !tbody) return;
+
+  if (removed.length === 0) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const retention = dashboardData.removedRetentionDays || 120;
+  if (sub) {
+    sub.innerHTML = `Their uploaded reports stay available for <b>${retention} days</b> from the removal date, ` +
+                    `then the roster row and the Drive files are purged automatically.`;
+  }
+
+  tbody.innerHTML = removed.map(function(u) {
+    const daysLeft = (u.retentionDaysLeft === null || u.retentionDaysLeft === undefined) ? null : u.retentionDaysLeft;
+    let retHtml;
+    if (daysLeft === null) {
+      retHtml = '<span class="badge b-grey">Unknown</span>';
+    } else if (daysLeft <= 7) {
+      retHtml = `<span class="badge b-red">${daysLeft} day${daysLeft === 1 ? '' : 's'} left</span>`;
+    } else if (daysLeft <= 30) {
+      retHtml = `<span class="badge b-amber">${daysLeft} days left</span>`;
+    } else {
+      retHtml = `<span class="badge b-green">${daysLeft} days left</span>`;
+    }
+    const removedOn = u.removedAt
+      ? `<span title="${esc(u.removedAt)}">${esc(String(u.removedAt).substring(0, 10))}</span>`
+      : '<span style="color:var(--t3)">&#8212;</span>';
+    return `<tr data-user="${esc(u.name)}">
+      <td style="font-weight:600">${esc(u.name)}</td>
+      <td>${removedOn}</td>
+      <td>${retHtml}</td>
+      <td><span style="font-size:12px;color:var(--t3)">${u.email ? esc(u.email) : '&#8212;'}</span></td>
+      <td>
+        <div class="action-cell">
+          <button class="btn btn-green btn-sm js-restore-user" data-name="${esc(u.name)}">&#8634; Restore</button>
+          <button class="btn btn-red btn-sm js-purge-user" data-name="${esc(u.name)}">&#128465; Purge now</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// Fill the Add-User System dropdown from the server-provided option list, so
+// the values always match what downloadUrlForSystem_ knows how to resolve.
+function populateSystemOptions() {
+  const sel = document.getElementById('newRegDevSystem');
+  const cfg = dashboardData.utilityDownload || {};
+  const opts = cfg.systemOptions || [];
+  if (!sel || opts.length === 0) return;
+  if (sel.options.length === opts.length + 1) return; // already populated
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">Not specified</option>' +
+    opts.map(function(o) { return `<option value="${esc(o.value)}">${esc(o.value)}</option>`; }).join('');
+  if (prev) sel.value = prev;
+  const verEl = document.getElementById('utilLatestVersion');
+  if (verEl) verEl.textContent = 'v' + (cfg.latestVersion || '—');
 }
 
 // Global Search
@@ -2193,6 +2700,133 @@ function uninstallStall() {
     .withFailureHandler(function(e) { showToastV2('Uninstall failed: ' + e.toString(), 'error'); })
     .uninstallStallTrigger();
 }
+// v5: weekly admin digest controls (Health page)
+function loadWeeklyDigestControls() {
+  google.script.run
+    .withSuccessHandler(function(cfg) {
+      var box = document.getElementById('weeklyDigestBox');
+      if (!box) return;
+      var installed = !!cfg.triggerInstalled;
+      var recips = cfg.recipients || [];
+      var fallbackNote = cfg.usingAdminAllowlistFallback
+        ? '<div style="font-size:0.78rem;color:var(--amber,#f59e0b);margin-top:0.5rem;">' +
+          'No dedicated recipients set &#8212; falling back to the admin allowlist above. ' +
+          'Set explicit recipients so the digest survives allowlist changes.</div>'
+        : '';
+      var noRecips = recips.length === 0
+        ? '<div style="font-size:0.78rem;color:var(--red,#ef4444);margin-top:0.5rem;">' +
+          '<b>No recipients.</b> The digest will be skipped until an address is set here or in the admin allowlist.</div>'
+        : '';
+      box.innerHTML =
+        '<div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">' +
+          '<span style="display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.7rem;border-radius:999px;background:' +
+            (installed ? 'rgba(16,185,129,0.15)' : 'rgba(148,163,184,0.15)') + ';color:' +
+            (installed ? '#34d399' : '#94a3b8') + ';font-weight:700;font-size:0.78rem;">' +
+            (installed ? '● ' + esc(cfg.scheduleDescription || 'Scheduled') : '○ Not scheduled') +
+          '</span>' +
+          '<button class="btn btn-sm ' + (installed ? 'btn-ghost' : 'btn-primary') + '" onclick="' +
+            (installed ? 'uninstallWeeklyDigest()' : 'installWeeklyDigest()') + '">' +
+            (installed ? 'Uninstall' : 'Install') + '</button>' +
+          '<button class="btn btn-ghost btn-sm" onclick="previewWeeklyDigest()">Preview</button>' +
+          '<button class="btn btn-ghost btn-sm" onclick="sendWeeklyDigestNow()">Send now</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.85rem;">' +
+          '<input type="text" id="digestRecipientsInput" placeholder="dhairya@sigmasolve.com, tejas@sigmasolve.com" ' +
+            'value="' + esc(recips.join(', ')) + '" style="flex:1;min-width:260px;">' +
+          '<button class="btn btn-primary btn-sm" onclick="saveDigestRecipients()">Save recipients</button>' +
+        '</div>' +
+        fallbackNote + noRecips +
+        '<div id="digestPreviewBox" style="margin-top:0.85rem;"></div>';
+    })
+    .withFailureHandler(function(e) {
+      var box = document.getElementById('weeklyDigestBox');
+      if (box) box.innerHTML = '<span style="color:var(--red)">Failed to load: ' + esc(e.toString()) + '</span>';
+    })
+    .getWeeklyDigestConfig();
+}
+
+function saveDigestRecipients() {
+  var input = document.getElementById('digestRecipientsInput');
+  if (!input) return;
+  google.script.run
+    .withSuccessHandler(function(r) {
+      if (r && r.success) {
+        showToastV2('Digest recipients saved (' + r.recipients.length + ')', 'success');
+        loadWeeklyDigestControls();
+      } else {
+        showToastV2(r && r.error || 'Save failed', 'error');
+      }
+    })
+    .withFailureHandler(function(e) { showToastV2('Save failed: ' + e.toString(), 'error'); })
+    .setWeeklyDigestRecipients(input.value);
+}
+
+function installWeeklyDigest() {
+  google.script.run
+    .withSuccessHandler(function(r) { showToastV2(r && r.message || 'Installed', 'success'); loadWeeklyDigestControls(); })
+    .withFailureHandler(function(e) { showToastV2('Install failed: ' + e.toString(), 'error'); })
+    .installWeeklyDigestTrigger();
+}
+
+function uninstallWeeklyDigest() {
+  google.script.run
+    .withSuccessHandler(function(r) { showToastV2('Removed ' + (r && r.removed || 0) + ' trigger(s)', 'success'); loadWeeklyDigestControls(); })
+    .withFailureHandler(function(e) { showToastV2('Uninstall failed: ' + e.toString(), 'error'); })
+    .uninstallWeeklyDigestTrigger();
+}
+
+// Dry run — shows exactly what the Monday email would contain, sends nothing.
+function previewWeeklyDigest() {
+  var box = document.getElementById('digestPreviewBox');
+  if (box) box.innerHTML = '<span style="color:var(--t3);font-size:0.82rem;">Building preview&#8230;</span>';
+  google.script.run
+    .withSuccessHandler(function(p) {
+      if (!box) return;
+      var missing  = p.missing || [];
+      var outdated = p.outdated || [];
+      function list(items, render) {
+        if (items.length === 0) return '<div style="color:var(--green);font-size:0.82rem;">None</div>';
+        return '<ul style="margin:0.35rem 0 0 1.1rem;padding:0;font-size:0.82rem;color:var(--t2);line-height:1.7">' +
+          items.map(render).join('') + '</ul>';
+      }
+      box.innerHTML =
+        '<div style="padding:0.85rem 1rem;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:10px;">' +
+          '<div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.06em;color:var(--t3);margin-bottom:0.5rem;">' +
+            'Period: ' + esc(p.period.label) + '</div>' +
+          '<div style="font-weight:600;font-size:0.85rem;margin-top:0.6rem;">Missing reports (' + missing.length + ')</div>' +
+          list(missing, function(u) {
+            return '<li>' + esc(u.name) + (u.email ? '' : ' <span style="color:var(--amber)">(no email)</span>') + '</li>';
+          }) +
+          '<div style="font-weight:600;font-size:0.85rem;margin-top:0.8rem;">Outdated versions (' + outdated.length + ') &#8212; latest v' + esc(p.latestVersion) + '</div>' +
+          list(outdated, function(u) {
+            return '<li>' + esc(u.name) + ' &#8212; v' + esc(u.version) + '</li>';
+          }) +
+          '<div style="font-size:0.78rem;color:var(--t3);margin-top:0.85rem;">Would be sent to: ' +
+            (p.recipients.length ? esc(p.recipients.join(', ')) : '<span style="color:var(--red)">nobody</span>') + '</div>' +
+        '</div>';
+    })
+    .withFailureHandler(function(e) {
+      if (box) box.innerHTML = '<span style="color:var(--red);font-size:0.82rem;">Preview failed: ' + esc(e.toString()) + '</span>';
+    })
+    .previewWeeklyAdminDigest();
+}
+
+function sendWeeklyDigestNow() {
+  showConfirm('Send the weekly digest email now, outside its Monday schedule?', 'Send now', function() {
+    showToastV2('Sending digest…', 'info');
+    google.script.run
+      .withSuccessHandler(function(r) {
+        if (r && r.success) {
+          showToastV2('Digest sent: ' + r.missingCount + ' missing, ' + r.outdatedCount + ' outdated', 'success');
+        } else {
+          showToastV2(r && r.error || 'Send failed', 'error');
+        }
+      })
+      .withFailureHandler(function(e) { showToastV2('Send failed: ' + e.toString(), 'error'); })
+      .adminSendWeeklyDigestNow();
+  });
+}
+
 function runStallNow() {
   showToastV2('Running stall scan...', 'info');
   google.script.run
@@ -2384,6 +3018,7 @@ initCsvUpload();
       try { loadAutoGenStatus(); } catch (e) {}
       try { loadAdminAllowlist(); } catch (e) {}
       try { loadStallControls(); } catch (e) {}
+      try { loadWeeklyDigestControls(); } catch (e) {}
     }
   };
 })();

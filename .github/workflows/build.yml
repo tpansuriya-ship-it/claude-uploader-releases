@@ -10,7 +10,12 @@ permissions:
   contents: write
 
 env:
-  RELEASE_VERSION: 2.0.5
+  # Single source of truth for the release version. Bump this and the four
+  # `--output dist/<ver>/...` paths in claude-usage-uploader/package.json together,
+  # then tag v<ver>. Everything downstream reads RELEASE_VERSION rather than
+  # repeating the number, which is what made the 2.0.5 -> 2.0.6 bump a ten-place
+  # edit and a guaranteed broken build.
+  RELEASE_VERSION: 2.0.6
 
 jobs:
   build:
@@ -49,7 +54,7 @@ jobs:
         pnpm run build-mac-x64
         pnpm run build-mac-arm64
         pnpm run build-linux
-        cp repair-v2.0.5.ps1 Repair-Claude-Uploader.cmd dist/${RELEASE_VERSION}/
+        cp repair-v${RELEASE_VERSION}.ps1 Repair-Claude-Uploader.cmd dist/${RELEASE_VERSION}/
         sha256sum dist/${RELEASE_VERSION}/* | tee dist/${RELEASE_VERSION}/SHA256SUMS.txt
         
     - name: Upload Artifacts
@@ -72,7 +77,7 @@ jobs:
     - name: Smoke test Windows executable startup
       shell: pwsh
       run: |
-        $exe = Resolve-Path 'dist-smoke\ClaudeUsageUploader_v2.0.5-win-x64.exe'
+        $exe = Resolve-Path "dist-smoke\ClaudeUsageUploader_v$env:RELEASE_VERSION-win-x64.exe"
         $work = Join-Path $env:RUNNER_TEMP 'claude-uploader-smoke'
         New-Item -ItemType Directory -Force -Path $work | Out-Null
         $copy = Join-Path $work 'ClaudeUsageUploader.exe'
@@ -130,13 +135,13 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         name: Claude Usage Uploader ${{ github.ref_name }}
-        body_path: claude-usage-uploader/RELEASE_NOTES_v2.0.5.md
+        body_path: claude-usage-uploader/RELEASE_NOTES_v${{ env.RELEASE_VERSION }}.md
         overwrite_files: true
         files: |
-          claude-usage-uploader/dist/2.0.5/ClaudeUsageUploader_v2.0.5-win-x64.exe
-          claude-usage-uploader/dist/2.0.5/ClaudeUsageUploader_v2.0.5-macos-x64
-          claude-usage-uploader/dist/2.0.5/ClaudeUsageUploader_v2.0.5-macos-arm64
-          claude-usage-uploader/dist/2.0.5/ClaudeUsageUploader_v2.0.5-linux-x64
-          claude-usage-uploader/dist/2.0.5/repair-v2.0.5.ps1
-          claude-usage-uploader/dist/2.0.5/Repair-Claude-Uploader.cmd
-          claude-usage-uploader/dist/2.0.5/SHA256SUMS.txt
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/ClaudeUsageUploader_v${{ env.RELEASE_VERSION }}-win-x64.exe
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/ClaudeUsageUploader_v${{ env.RELEASE_VERSION }}-macos-x64
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/ClaudeUsageUploader_v${{ env.RELEASE_VERSION }}-macos-arm64
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/ClaudeUsageUploader_v${{ env.RELEASE_VERSION }}-linux-x64
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/repair-v${{ env.RELEASE_VERSION }}.ps1
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/Repair-Claude-Uploader.cmd
+          claude-usage-uploader/dist/${{ env.RELEASE_VERSION }}/SHA256SUMS.txt

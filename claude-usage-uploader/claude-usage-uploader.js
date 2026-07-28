@@ -38,7 +38,7 @@ const IS_LINUX = process.platform === 'linux';
 const PLATFORM_KEY = IS_WIN ? 'win32' : IS_MAC ? 'darwin' : 'linux';
 
 // -------------------- CONFIGURATION --------------------
-const VERSION = '2.0.5';
+const VERSION = '2.0.6';
 const FORCE_RUN = process.argv.includes('--force');
 const IS_SCHEDULED = process.argv.includes('--scheduled');
 const UPDATED_FROM = (() => {
@@ -55,8 +55,17 @@ const UPDATE_CHECK_MS       = 60  * 60 * 1000;     // retry update discovery eve
 const MANIFEST_URL = 'https://gist.githubusercontent.com/tpansuriya-ship-it/efa5db7d25aaa85db78d8bdc402f9903/raw/version.json';
 
 // Shared HMAC secret between uploader and GAS webhook endpoint.
-// GAS validates X-Uploader-Signature on every incoming request.
-const WEBHOOK_HMAC_SECRET = 'ss-uploader-hmac-2026-b7f3a9c1d4e2';
+// GAS validates the _sig query parameter on every incoming request.
+//
+// v2.0.6: rotated. The previous value shipped in this public repository for
+// several releases, so anyone could forge pings for any developer name. The GAS
+// side accepts BOTH this value and the retired one (see WEBHOOK_HMAC_SECRET_RETIRED
+// in Code.gs) until the fleet has self-updated, then the old one is removed.
+//
+// NOTE: this constant is still committed, so it is only as private as the repo.
+// The durable fix is to inject it at build time from a CI secret and keep it out
+// of source entirely.
+const WEBHOOK_HMAC_SECRET = 'ss-uploader-hmac-2026b-cab69d71b7b5cc93fe49e24818bc8cc2';
 
 const DRIVE_FOLDER_ID = '0AMXBcPT9R10cUk9PVA';
 let globalCcusageJsPath = '';
@@ -408,12 +417,30 @@ function sendPingOnce(payload) {
         if (parsed.result === 'error') {
           if (parsed.error === 'invalid_signature') {
             log(`CRITICAL: GAS rejected webhook signature (${parsed.reason || parsed.error}). ` +
-                `Verify system clock is accurate — tolerance is 1 hour.`);
+                `Check the deployment's "Who has access" is set to Anyone, and that the ` +
+                `system clock is within 5 minutes of real time.`);
           }
           return { ok: false, status: statusCode, body: rawBody };
         }
-      } catch (_) { /* non-JSON body — not an application-level error */ }
-      return { ok: true, status: statusCode, body: rawBody };
+        return { ok: true, status: statusCode, body: rawBody };
+      } catch (_) {
+        // v2.0.6: a non-JSON body is a FAILURE, not a success.
+        //
+        // doPost always answers with JSON. Anything else means the request never
+        // reached it — overwhelmingly an HTML sign-in page, because the web-app
+        // deployment is restricted rather than "Anyone". The old code returned
+        // ok:true here, so the agent believed every ping was delivered while the
+        // server recorded nothing: the entire fleet read as Offline for weeks with
+        // not one line in any log. Failing here lets the retry queue engage and
+        // puts the cause in the local log.
+        const snippet = String(rawBody || '').replace(/\s+/g, ' ').slice(0, 120);
+        const looksLikeLogin = /<html|sign in|accounts\.google\.com/i.test(rawBody || '');
+        log(`CRITICAL: webhook returned non-JSON (HTTP ${statusCode})` +
+            (looksLikeLogin
+              ? ' — this is a Google sign-in page. Set the web-app deployment access to "Anyone".'
+              : ` — first bytes: ${snippet}`));
+        return { ok: false, status: statusCode, body: rawBody };
+      }
     };
 
     const req = https.request(options, res => {
@@ -421,14 +448,46 @@ function sendPingOnce(payload) {
       res.on('data', c => { body += c; });
       res.on('end', () => {
         if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
-          const r2Options = { timeout: PING_TIMEOUT_MS };
-          const r2Req = https.get(res.headers.location, r2Options, r2 => {
+          // v2.0.6: RE-POST the body on redirect.
+          //
+          // Apps Script /exec answers POSTs with a 302 to script.googleusercontent.com.
+          // Up to v2.0.5 this followed that redirect with https.get() — a GET with no
+          // body. The _ts/_sig query params survived, but the payload did not, so GAS
+          // hashed ts+'.'+'' while we had signed ts+'.'+data. Every such ping was
+          // rejected as `sig_mismatch`, which sent everyone hunting for a wrong secret
+          // when the real problem was a discarded request body.
+          //
+          // Re-issuing as a POST with the same body and headers keeps the signature
+          // valid across the hop.
+          let loc;
+          try {
+            loc = new URL(res.headers.location, WEBHOOK_URL);
+          } catch (_) {
+            resolve({ ok: false, status: res.statusCode, body: 'unparseable redirect location' });
+            return;
+          }
+          const r2Options = {
+            hostname: loc.hostname,
+            port: loc.port || 443,
+            path: loc.pathname + loc.search,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(data),
+            },
+            timeout: PING_TIMEOUT_MS,
+          };
+          const r2Req = https.request(r2Options, r2 => {
             let b2 = '';
-            r2.on('data', c => b2 += c);
-            r2.on('end', () => resolve(checkBody(res.statusCode, b2)));
+            r2.on('data', c => { b2 += c; });
+            r2.on('end', () => resolve(checkBody(r2.statusCode, b2)));
           });
-          r2Req.on('error', () => resolve({ ok: true, status: res.statusCode, body }));
-          r2Req.on('timeout', () => { r2Req.destroy(); resolve({ ok: true, status: res.statusCode, body }); });
+          // A failed redirect hop is a failed ping. Reporting ok:true here (as
+          // v2.0.5 did) is what made delivery failures invisible.
+          r2Req.on('error', (e) => resolve({ ok: false, status: 0, body: 'redirect hop failed: ' + e.message }));
+          r2Req.on('timeout', () => { r2Req.destroy(); resolve({ ok: false, status: 0, body: 'redirect hop timeout' }); });
+          r2Req.write(data);
+          r2Req.end();
           return;
         }
         resolve(checkBody(res.statusCode, body));
