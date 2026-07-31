@@ -1,37 +1,58 @@
 <style>
 :root {
-  /* &#55356;&#57256; Premium Obsidian Glass Theme Variables */
-  --bg: #060709;
-  --bg2: #080B14;
-  --bg3: rgba(10, 13, 23, 0.92);
-  --glass: rgba(255, 255, 255, 0.04);
-  --glass-b: rgba(255, 255, 255, 0.07);
-  --glass-hv: rgba(255, 255, 255, 0.10);
-  
-  /* Accent Colors */
-  --indigo: #00D1FF;                    /* Neon Blue */
-  --purple: #8A2BE2;                    /* Deep Purple */
-  --cyan: #00E676;                      /* Luminous Green */
-  --green: #00E676;                     /* Luminous Green */
-  --amber: #FFB300;                     /* Luminous Amber */
-  --red: #FF1744;                       /* Luminous Rose */
-  
-  /* Text Theme */
-  --t1: #ffffff;
-  --t2: #bbc9cf;
-  --t3: #859399;
-  --t4: #464554;
-  
-  /* Glowing Shadows & Radii */
-  --r: 8px;
-  --rs: 6px;
-  --rx: 6px;
-  --shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.55);
-  --glow-indigo: 0 0 20px rgba(0, 209, 255, 0.25);
-  --glow-green: 0 0 20px rgba(0, 230, 118, 0.25);
-  --glow-red: 0 0 20px rgba(255, 23, 68, 0.25);
-  --glow-amber: 0 0 20px rgba(255, 179, 0, 0.25);
-  --glow-cyan: 0 0 20px rgba(0, 209, 255, 0.25);
+  /* ================================================================
+     SIGMA SOLVE LIGHT THEME (default)
+     ================================================================
+     Rewritten 2026-07-31 from the previous dark "Obsidian" palette to a
+     clean white/light surface. Almost every rule in this file already reads
+     these variables, so redefining them here converts the whole dashboard —
+     all pages — in one place. A LIGHT THEME OVERRIDES block at the bottom of
+     this file fixes the handful of rules that hardcoded dark-only assumptions
+     (white-on-white highlights, screen-blend glows, light-on-dark particles).
+
+     Status colours are DARKENED versus the dark theme: #00E676 green and
+     #FFB300 amber are readable on near-black but fail contrast on white, so
+     they move to their 600/700-weight equivalents. The brand blue #0047FB is
+     already strong on white and is unchanged.                              */
+
+  --bg:  #f1f5f9;                       /* app background — soft grey, not pure white,
+                                           so white cards read as raised surfaces */
+  --bg2: #ffffff;                       /* sidebar / topbar / table headers */
+  --bg3: #ffffff;                       /* card surface */
+  --glass:    rgba(15, 23, 42, 0.025);  /* subtle fills — now dark-on-light, was white-on-dark */
+  --glass-b:  rgba(15, 23, 42, 0.11);   /* borders */
+  --glass-hv: rgba(15, 23, 42, 0.055);  /* hover fills */
+
+  /* Accent Colors — Sigma Solve brand: deep blue -> cyan (sampled from the logo mark) */
+  --indigo: #0047FB;                    /* Sigma Solve Blue */
+  --purple: #0087BD;                    /* Sigma Solve Cyan, darkened for white-bg contrast */
+  --cyan:   #0087BD;                    /* Sigma Solve Cyan, darkened for white-bg contrast */
+  --green:  #059669;                    /* status green — darkened for legibility on white */
+  --amber:  #B45309;                    /* status amber — darkened for legibility on white */
+  --red:    #DC2626;                    /* status red — darkened for legibility on white */
+
+  /* Text Theme — inverted: dark text on light surfaces */
+  --t1: #0f172a;                        /* primary text */
+  --t2: #475569;                        /* secondary */
+  --t3: #64748b;                        /* muted / labels */
+  --t4: #94a3b8;                        /* faintest / disabled */
+
+  /* Surface chrome */
+  --sidebar-bg: #ffffff;
+  --topbar-bg:  rgba(255, 255, 255, 0.88);
+
+  /* Shadows & Radii — real depth shadows replace the dark theme's glows.
+     On white, a coloured "glow" reads as a smudge, so these become tight
+     tinted rings that still convey focus/state without looking blurry. */
+  --r: 10px;
+  --rs: 8px;
+  --rx: 7px;
+  --shadow: 0 1px 2px rgba(15,23,42,.06), 0 8px 24px rgba(15,23,42,.07);
+  --glow-indigo: 0 0 0 3px rgba(0, 71, 251, 0.14);
+  --glow-green:  0 0 0 3px rgba(5, 150, 105, 0.14);
+  --glow-red:    0 0 0 3px rgba(220, 38, 38, 0.14);
+  --glow-amber:  0 0 0 3px rgba(180, 83, 9, 0.14);
+  --glow-cyan:   0 0 0 3px rgba(0, 135, 189, 0.14);
 }
 
 * {
@@ -39,7 +60,7 @@
   margin: 0;
   padding: 0;
   scrollbar-width: thin;
-  scrollbar-color: rgba(0, 209, 255, 0.38) var(--bg2);
+  scrollbar-color: rgba(0, 71, 251, 0.38) var(--bg2);
 }
 
 /* Scrollbar styles */
@@ -51,7 +72,7 @@
   background: var(--bg2);
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 209, 255, 0.38);
+  background: rgba(0, 71, 251, 0.38);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
@@ -60,11 +81,14 @@
 
 body {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  /* Light theme: a barely-there brand tint in the corners keeps the page from
+     looking like flat printer paper, without competing with card content. */
   background:
-    radial-gradient(ellipse 60% 50% at 20% 60%, rgba(0, 60, 120, 0.18) 0%, transparent 70%),
-    radial-gradient(ellipse 50% 40% at 80% 20%, rgba(100, 0, 200, 0.12) 0%, transparent 60%),
-    #060709;
+    radial-gradient(ellipse 60% 50% at 15% 0%,  rgba(0, 71, 251, 0.05) 0%, transparent 60%),
+    radial-gradient(ellipse 50% 40% at 90% 10%, rgba(0, 135, 189, 0.05) 0%, transparent 55%),
+    var(--bg);
   background-size: cover, cover, cover;
+  background-attachment: fixed;
   color: var(--t1);
   min-height: 100vh;
   overflow-x: hidden;
@@ -75,10 +99,16 @@ body {
 .app-shell{display:flex;height:100vh;overflow:hidden;position:relative;z-index:1}
 
 /* SIDEBAR */
-.sidebar{width:240px;flex-shrink:0;background:rgba(15,23,42,.92);border-right:1px solid var(--glass-b);
-  backdrop-filter:blur(24px);display:flex;flex-direction:column;transition:width .3s;overflow:hidden;z-index:100}
-.sidebar-brand{padding:20px 18px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--glass-b)}
-.sidebar-brand img{width:auto;max-width:160px;height:40px;object-fit:contain;border-radius:0}
+.sidebar{width:240px;flex-shrink:0;background:var(--sidebar-bg);border-right:1px solid var(--glass-b);
+  display:flex;flex-direction:column;transition:width .3s;overflow:hidden;z-index:100}
+/* The embedded logo has WHITE wordmark text baked into the PNG, so on a white
+   sidebar the "Sigma Solve" text would be invisible. Sit it on a dark brand
+   chip — deliberate-looking, and keeps the logo legible without needing a
+   separate dark-text asset. Swap in a dark-text logo and this can go away. */
+.sidebar-brand{padding:16px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--glass-b)}
+.sidebar-brand img{width:auto;max-width:100%;height:38px;object-fit:contain;border-radius:0;display:block;margin:0 auto}
+.brand-chip{background:linear-gradient(135deg,#0b1220,#132038);border-radius:10px;padding:10px 14px;width:100%;
+  display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(15,23,42,.14)}
 .sidebar-brand-text{font-size:13px;font-weight:700;letter-spacing:-.3px}
 .sidebar-brand-sub{font-size:10px;color:var(--t3);margin-top:1px}
 .sidebar-nav{flex:1;padding:12px 10px;overflow-y:auto}
@@ -86,8 +116,8 @@ body {
   font-size:13px;font-weight:500;color:var(--t3);cursor:pointer;transition:all .2s;margin-bottom:2px;
   border:1px solid transparent;user-select:none}
 .nav-item:hover{background:var(--glass-hv);color:var(--t2)}
-.nav-item.active{background:rgba(99,102,241,.12);color:var(--indigo);border-color:rgba(99,102,241,.25);
-  box-shadow:0 0 12px rgba(99,102,241,.15)}
+.nav-item.active{background:rgba(0,71,251,.12);color:var(--indigo);border-color:rgba(0,71,251,.25);
+  box-shadow:0 0 12px rgba(0,71,251,.15)}
 .nav-item .nav-icon{font-size:16px;width:22px;text-align:center;flex-shrink:0}
 .nav-label{font-size:10px;font-weight:700;color:var(--t4);text-transform:uppercase;letter-spacing:.8px;
   padding:16px 14px 6px;user-select:none}
@@ -100,7 +130,7 @@ body {
 
 /* TOP BAR */
 .top-bar{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;
-  border-bottom:1px solid var(--glass-b);background:rgba(15,23,42,.6);backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--glass-b);background:var(--topbar-bg);backdrop-filter:blur(16px);
   flex-shrink:0;gap:12px;flex-wrap:wrap;z-index:50}
 .top-bar-left{display:flex;align-items:center;gap:12px}
 .page-title{font-size:18px;font-weight:700;letter-spacing:-.4px}
@@ -132,7 +162,7 @@ body {
   font-size:12px;font-weight:500;border:1px solid;backdrop-filter:blur(8px)}
 .alert-chip.alert-warn{background:rgba(245,158,11,.08);border-color:rgba(245,158,11,.3);color:var(--amber)}
 .alert-chip.alert-crit{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.3);color:var(--red)}
-.alert-chip.alert-info{background:rgba(6,182,212,.08);border-color:rgba(6,182,212,.3);color:var(--cyan)}
+.alert-chip.alert-info{background:rgba(0,174,239,.08);border-color:rgba(0,174,239,.3);color:var(--cyan)}
 .alert-chip.alert-ok{background:rgba(16,185,129,.08);border-color:rgba(16,185,129,.3);color:var(--green)}
 
 /* SECTION HEADER */
@@ -170,7 +200,7 @@ body {
 .hd-left{display:flex;align-items:center;gap:14px}
 .hd-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .hd-logo{width:48px;height:48px;border-radius:14px;flex-shrink:0;
-  background:linear-gradient(135deg,#6366f1,#8b5cf6);
+  background:linear-gradient(135deg,#0047FB,#00AEEF);
   display:flex;align-items:center;justify-content:center;
   font-size:24px;box-shadow:var(--glow-indigo)}
 .hd-title{font-size:21px;font-weight:700;letter-spacing:-.5px}
@@ -238,12 +268,12 @@ body {
 .card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;gap:12px;flex-wrap:wrap;position:relative;z-index:1}
 .card-hd-left{display:flex;align-items:center;gap:10px}
 .card-icon{width:38px;height:38px;border-radius:10px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:18px}
-.ci-indigo{background:rgba(0,209,255,.18);box-shadow:var(--glow-indigo)}
+.ci-indigo{background:rgba(0,71,251,.18);box-shadow:var(--glow-indigo)}
 .ci-green {background:rgba(0,230,118,.18);box-shadow:var(--glow-green)}
-.ci-cyan  {background:rgba(0,209,255,.18);box-shadow:var(--glow-indigo)}
+.ci-cyan  {background:rgba(0,174,239,.18);box-shadow:var(--glow-cyan)}
 .ci-amber {background:rgba(255,179,0,.18);box-shadow:var(--glow-amber)}
 .ci-red   {background:rgba(255,23,68,.18);box-shadow:var(--glow-red)}
-.ci-purple{background:rgba(138,43,226,.18);box-shadow:0 0 12px rgba(138,43,226,.2)}
+.ci-purple{background:rgba(0,174,239,.18);box-shadow:0 0 12px rgba(0,174,239,.2)}
 .card-title{font-size:15px;font-weight:700;letter-spacing:-.2px;font-family:'Outfit',sans-serif}
 .card-subtitle{font-size:12px;color:var(--t3);margin-top:2px}
 
@@ -264,7 +294,7 @@ body {
 .stat-box:hover{transform:translateY(-3px);border-color:var(--indigo);box-shadow:var(--glow-indigo)}
 .stat-val{font-size:30px;font-weight:800;letter-spacing:-1.5px;font-family:'Outfit',sans-serif}
 .stat-lbl{font-size:11px;color:var(--t3);margin-top:5px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
-.sv-indigo{background:linear-gradient(135deg,#00D1FF,#8A2BE2);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sv-indigo{background:linear-gradient(135deg,#0047FB,#00AEEF);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .sv-green {color:var(--green)} .sv-red{color:var(--red)} .sv-amber{color:var(--amber)} .sv-cyan{color:var(--cyan)}
 
 /* TABLE */
@@ -283,10 +313,10 @@ body {
    scrollbars are defined globally above. */
 .table-wrap{overflow-x:auto;overflow-y:auto;max-height:480px;-webkit-overflow-scrolling:touch;
   border:1px solid var(--glass-b);border-radius:var(--rx);background:rgba(15,23,42,.2);
-  scrollbar-width:thin;scrollbar-color:rgba(0,209,255,.3) var(--bg2)}
+  scrollbar-width:thin;scrollbar-color:rgba(0,71,251,.3) var(--bg2)}
 .table-wrap::-webkit-scrollbar{width:6px;height:6px}
 .table-wrap::-webkit-scrollbar-track{background:var(--bg2);border-radius:var(--rx)}
-.table-wrap::-webkit-scrollbar-thumb{background:rgba(0,209,255,.38);border-radius:4px}
+.table-wrap::-webkit-scrollbar-thumb{background:rgba(0,71,251,.38);border-radius:4px}
 .table-wrap::-webkit-scrollbar-thumb:hover{background:var(--t3)}
 
 /* v3: CSV reconciliation upload zone */
@@ -306,20 +336,20 @@ body {
 .b-red   {background:rgba(239,68,68,.14); color:var(--red);  border:1px solid rgba(239,68,68,.3); box-shadow:0 0 8px rgba(239,68,68,.2)}
 .b-amber {background:rgba(245,158,11,.14);color:var(--amber);border:1px solid rgba(245,158,11,.3);box-shadow:0 0 8px rgba(245,158,11,.2)}
 .b-grey  {background:rgba(144,143,160,.12);color:var(--t3); border:1px solid rgba(144,143,160,.25)}
-.b-indigo{background:rgba(99,102,241,.14);color:var(--indigo);border:1px solid rgba(99,102,241,.3);box-shadow:0 0 8px rgba(99,102,241,.2)}
-.b-cyan  {background:rgba(6,182,212,.14); color:var(--cyan);  border:1px solid rgba(6,182,212,.3); box-shadow:0 0 8px rgba(6,182,212,.2)}
+.b-indigo{background:rgba(0,71,251,.14);color:var(--indigo);border:1px solid rgba(0,71,251,.3);box-shadow:0 0 8px rgba(0,71,251,.2)}
+.b-cyan  {background:rgba(0,174,239,.14); color:var(--cyan);  border:1px solid rgba(0,174,239,.3); box-shadow:0 0 8px rgba(0,174,239,.2)}
 .b-purple{background:rgba(139,92,246,.14);color:var(--purple);border:1px solid rgba(139,92,246,.3);box-shadow:0 0 8px rgba(139,92,246,.2)}
 
 /* STATUS DOT */
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .dot-online {background:var(--green);box-shadow:0 0 10px rgba(16,185,129,.8);animation:pulse-g 2s infinite}
-.dot-waiting{background:var(--cyan); box-shadow:0 0 8px rgba(6,182,212,.6); animation:pulse-c 2s infinite}
+.dot-waiting{background:var(--cyan); box-shadow:0 0 8px rgba(0,174,239,.6); animation:pulse-c 2s infinite}
 .dot-away   {background:var(--amber);box-shadow:0 0 7px rgba(245,158,11,.5)}
 .dot-offline{background:var(--t4)}
 .dot-stalled{background:var(--red);box-shadow:0 0 8px rgba(239,68,68,.7);animation:pulse-r 1.5s infinite}
 .status-cell{display:flex;align-items:center;gap:8px;white-space:nowrap}
 @keyframes pulse-g{0%,100%{box-shadow:0 0 4px rgba(16,185,129,.5)}50%{box-shadow:0 0 14px rgba(16,185,129,.95)}}
-@keyframes pulse-c{0%,100%{box-shadow:0 0 4px rgba(6,182,212,.5)}50%{box-shadow:0 0 14px rgba(6,182,212,.95)}}
+@keyframes pulse-c{0%,100%{box-shadow:0 0 4px rgba(0,174,239,.5)}50%{box-shadow:0 0 14px rgba(0,174,239,.95)}}
 @keyframes pulse-r{0%,100%{box-shadow:0 0 4px rgba(239,68,68,.5)}50%{box-shadow:0 0 14px rgba(239,68,68,.95)}}
 
 /* BUTTONS */
@@ -327,9 +357,9 @@ body {
   border-radius:var(--rx);font-size:12px;font-weight:600;cursor:pointer;
   font-family:'Inter',sans-serif;transition:all .2s;white-space:nowrap}
 .btn:disabled{opacity:.4;cursor:not-allowed!important;transform:none!important;box-shadow:none!important}
-.btn-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;box-shadow:0 2px 12px rgba(99,102,241,.35)}
+.btn-primary{background:linear-gradient(135deg,#0047FB,#00AEEF);color:#fff;box-shadow:0 2px 12px rgba(0,71,251,.35)}
 .btn-primary:hover:not(:disabled){opacity:.9;box-shadow:var(--glow-indigo);transform:translateY(-1px)}
-.btn-cyan{background:linear-gradient(135deg,#06b6d4,#3b82f6);color:#fff;box-shadow:0 2px 10px rgba(6,182,212,.3)}
+.btn-cyan{background:linear-gradient(135deg,#00AEEF,#0047FB);color:#fff;box-shadow:0 2px 10px rgba(0,174,239,.3)}
 .btn-cyan:hover:not(:disabled){opacity:.9;box-shadow:var(--glow-cyan);transform:translateY(-1px)}
 .btn-green{background:linear-gradient(135deg,#10b981,#059669);color:#fff;box-shadow:0 2px 10px rgba(16,185,129,.3)}
 .btn-green:hover:not(:disabled){opacity:.9;box-shadow:var(--glow-green);transform:translateY(-1px)}
@@ -341,13 +371,13 @@ body {
 .btn-ghost:hover:not(:disabled){border-color:var(--indigo);color:var(--t1);background:var(--glass-hv)}
 .btn-sm{padding:5px 10px;font-size:11px}
 .btn-queued{background:rgba(16,185,129,.14);border:1px solid rgba(16,185,129,.35);color:var(--green);pointer-events:none}
-.btn-pinged{background:rgba(6,182,212,.14); border:1px solid rgba(6,182,212,.35); color:var(--cyan); pointer-events:none}
+.btn-pinged{background:rgba(0,174,239,.14); border:1px solid rgba(0,174,239,.35); color:var(--cyan); pointer-events:none}
 .action-cell{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 
 /* PROGRESS TRACKER */
 .prog-row td{padding:0!important;border-bottom:1px solid rgba(255,255,255,.04)}
-.prog-inner{display:none;padding:18px 22px;background:rgba(99,102,241,.06);
-  border-top:1px solid rgba(99,102,241,.18)}
+.prog-inner{display:none;padding:18px 22px;background:rgba(0,71,251,.06);
+  border-top:1px solid rgba(0,71,251,.18)}
 .prog-inner.open{display:block;animation:fadeIn .25s ease}
 .prog-steps{display:flex;align-items:center;margin-bottom:10px}
 .prog-step{display:flex;align-items:center;gap:7px}
@@ -355,13 +385,13 @@ body {
   align-items:center;justify-content:center;font-size:14px;
   background:rgba(255,255,255,.05);border:1px solid var(--glass-b);
   color:var(--t3);position:relative;z-index:1;transition:all .4s}
-.prog-icon.active{background:rgba(99,102,241,.25);border-color:var(--indigo);color:var(--indigo);box-shadow:var(--glow-indigo)}
+.prog-icon.active{background:rgba(0,71,251,.25);border-color:var(--indigo);color:var(--indigo);box-shadow:var(--glow-indigo)}
 .prog-icon.done  {background:rgba(16,185,129,.2);border-color:var(--green); color:var(--green); box-shadow:var(--glow-green)}
 .prog-icon.error {background:rgba(239,68,68,.2); border-color:var(--red);   color:var(--red);   box-shadow:var(--glow-red)}
 .prog-icon.spinning::after{content:'';position:absolute;inset:-4px;border-radius:50%;
   border:2px solid transparent;border-top-color:var(--indigo);animation:spin .75s linear infinite}
 .prog-connector{flex:1;height:2px;background:rgba(255,255,255,.08);margin:0 6px;min-width:24px;position:relative;overflow:hidden}
-.prog-fill{height:100%;width:0;background:linear-gradient(90deg,#6366f1,#8b5cf6);transition:width .6s ease}
+.prog-fill{height:100%;width:0;background:linear-gradient(90deg,#0047FB,#00AEEF);transition:width .6s ease}
 .prog-fill.done{width:100%}
 .prog-labels{display:flex;align-items:center;font-size:10px;font-weight:600;letter-spacing:.3px;color:var(--t3);text-transform:uppercase}
 .prog-lbl{flex:1;text-align:center}
@@ -379,7 +409,7 @@ body {
 .tl-filter{padding:4px 12px;border-radius:999px;font-size:11px;font-weight:600;
   cursor:pointer;border:1px solid var(--glass-b);background:var(--glass);color:var(--t3);
   transition:all .2s}
-.tl-filter.active,.tl-filter:hover{border-color:var(--indigo);color:var(--indigo);background:rgba(99,102,241,.1)}
+.tl-filter.active,.tl-filter:hover{border-color:var(--indigo);color:var(--indigo);background:rgba(0,71,251,.1)}
 .timeline{padding:4px 0}
 .tl-item{display:flex;gap:14px;padding:11px 0 11px 22px;border-left:2px solid rgba(255,255,255,.07);
   margin-left:8px;position:relative;animation:fadeLeft .2s ease both}
@@ -447,7 +477,7 @@ input[type="text"],input[type="email"],input[type="url"],textarea,select{
   color:var(--t1);padding:9px 13px;border-radius:var(--rx);
   font-size:13px;font-family:'Inter',sans-serif;outline:none;transition:all .2s}
 input[type="text"]:focus,input[type="email"]:focus,input[type="url"]:focus,textarea:focus,select:focus{
-  border-color:var(--indigo);background:var(--glass-hv);box-shadow:0 0 0 3px rgba(99,102,241,.15)}
+  border-color:var(--indigo);background:var(--glass-hv);box-shadow:0 0 0 3px rgba(0,71,251,.15)}
 input[type="text"]::placeholder,input[type="email"]::placeholder,
 input[type="url"]::placeholder,textarea::placeholder{color:var(--t3)}
 select option{background:var(--bg2);color:var(--t1)}
@@ -464,6 +494,13 @@ textarea{resize:vertical;min-height:90px;line-height:1.55;width:100%}
 .u-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
 .u-collapse{display:none;margin-top:12px}
 .u-collapse.open{display:block}
+/* v5.4: report-search quick-range buttons. Wraps so it degrades gracefully on a
+   narrow window instead of overflowing the card. */
+.rs-presets{display:flex;gap:8px;flex-wrap:wrap}
+/* Date inputs are native controls, so they inherit the browser's light styling
+   and become unreadable on the dark themes unless forced. color-scheme also
+   recolours the picker icon and popup. */
+.u-field input[type="date"]{color-scheme:dark}
 @media(max-width:640px){.u-form{grid-template-columns:1fr}}
 
 /* FORMS */
@@ -487,7 +524,7 @@ textarea{resize:vertical;min-height:90px;line-height:1.55;width:100%}
 /* LOADER */
 .loader-wrap{display:flex;flex-direction:column;align-items:center;gap:16px;padding:80px 20px}
 .loader-ring{width:48px;height:48px;border-radius:50%;
-  border:3px solid rgba(99,102,241,.2);border-top-color:var(--indigo);
+  border:3px solid rgba(0,71,251,.2);border-top-color:var(--indigo);
   animation:spin .9s linear infinite;box-shadow:var(--glow-indigo)}
 .loader-text{font-size:14px;color:var(--t3)}
 
@@ -683,7 +720,7 @@ body[data-theme] .nav-item.active {
 .theme-pill[data-theme="emerald"]:hover  { border-color: #10b981; color: #10b981; }
 .theme-pill[data-theme="synthwave"]:hover { border-color: #a855f7; color: #a855f7; }
 .theme-pill[data-theme="glass"]:hover     { border-color: #93c5fd; color: #93c5fd; }
-.theme-pill[data-theme="default"]:hover   { border-color: #6366f1; color: #6366f1; }
+.theme-pill[data-theme="default"]:hover   { border-color: #0047FB; color: #0047FB; }
 
 /* Responsive: hide pill labels on narrow sidebar */
 @media(max-width:860px) {
@@ -959,7 +996,7 @@ body[data-theme="synthwave"] .orb-3 { background: radial-gradient(circle, #38bdf
   width: 3px;
   border-radius: 0 3px 3px 0;
   background: var(--indigo);
-  box-shadow: 0 0 10px var(--indigo), 0 0 20px rgba(0,209,255,0.35);
+  box-shadow: 0 0 10px var(--indigo), 0 0 20px rgba(0,71,251,0.35);
   animation: navBarIn 0.3s cubic-bezier(0.4,0,0.2,1) both;
 }
 
@@ -1016,8 +1053,8 @@ body[data-theme="synthwave"] .orb-3 { background: radial-gradient(circle, #38bdf
 }
 
 @keyframes breathGlow {
-  0%   { box-shadow: 0 0 10px rgba(0,209,255,0.1), inset 0 0 5px rgba(0,209,255,0.1);  border-color: rgba(0,209,255,0.2); }
-  100% { box-shadow: 0 0 22px rgba(0,209,255,0.3), inset 0 0 10px rgba(0,209,255,0.15); border-color: rgba(0,209,255,0.45); }
+  0%   { box-shadow: 0 0 10px rgba(0,71,251,0.1), inset 0 0 5px rgba(0,71,251,0.1);  border-color: rgba(0,71,251,0.2); }
+  100% { box-shadow: 0 0 22px rgba(0,71,251,0.3), inset 0 0 10px rgba(0,71,251,0.15); border-color: rgba(0,71,251,0.45); }
 }
 
 @keyframes slideInRow {
@@ -1081,6 +1118,184 @@ body[data-theme="synthwave"] .orb-3 { background: radial-gradient(circle, #38bdf
   .main-area { margin-left: 0 !important; width: 100% !important; }
   .kpi-strip { grid-template-columns: 1fr 1fr !important; }
 }
+
+/* ==========================================================================
+   LIGHT THEME OVERRIDES  (added 2026-07-31)
+   --------------------------------------------------------------------------
+   The rules above were authored for a near-black background and hardcode a
+   number of dark-only assumptions that CSS variables alone cannot fix:
+   white-on-white sheen highlights, screen-blend glow orbs, light-coloured
+   particles, and a dark loading screen. Everything in this block exists
+   solely to correct those for the light surface — it is intentionally last
+   so it wins on equal specificity.
+   ========================================================================== */
+
+/* -- Card sheen: was a WHITE top highlight + white diagonal sweep, both of
+      which are invisible on white. Use a faint dark edge instead. --------- */
+.card::after {
+  background: linear-gradient(90deg, transparent, rgba(15,23,42,0.07), transparent);
+}
+.card::before {
+  background: linear-gradient(105deg, transparent 35%, rgba(15,23,42,0.028) 50%, transparent 65%);
+}
+.card:hover {
+  border-color: rgba(0,71,251,.34);
+  box-shadow: 0 2px 4px rgba(15,23,42,.05), 0 14px 38px rgba(15,23,42,.11);
+}
+.kpi-card:hover {
+  border-color: rgba(0,71,251,.30);
+  box-shadow: 0 2px 4px rgba(15,23,42,.05), 0 10px 26px rgba(15,23,42,.10);
+}
+.vm-card:hover {
+  border-color: rgba(0,71,251,.30);
+  box-shadow: 0 2px 4px rgba(15,23,42,.05), 0 12px 30px rgba(15,23,42,.10);
+}
+.data-table tbody tr:hover { background: rgba(0,71,251,.045); }
+
+/* -- Ambient orbs: mix-blend-mode:screen makes anything invisible on white
+      (screen against white === white). Switch to multiply so the brand tint
+      actually darkens the page slightly, and cut the intensity right down. */
+.ambient-orb {
+  mix-blend-mode: multiply;
+  opacity: 0.055;
+  filter: blur(120px);
+}
+.orb-1 { background: radial-gradient(circle, #0047FB 0%, rgba(255,255,255,0) 70%); }
+.orb-2 { background: radial-gradient(circle, #0087BD 0%, rgba(255,255,255,0) 70%); }
+.orb-3 { background: radial-gradient(circle, #0047FB 0%, rgba(255,255,255,0) 70%); }
+.orb-4 { background: radial-gradient(circle, #0087BD 0%, rgba(255,255,255,0) 70%); }
+.orb-5 { background: radial-gradient(circle, #0047FB 0%, rgba(255,255,255,0) 70%); }
+/* meshDrift's hue-rotate on a light page reads as a colour wobble — drop it. */
+.ambient-background { animation: none; }
+
+/* -- Particles were white-on-dark. On white they must be dark, and far
+      fainter, or they look like dust on the screen. --------------------- */
+.particle-field span,
+.particle-field span:nth-child(n) {
+  background: rgba(15,23,42,0.10) !important;
+}
+
+/* -- Loading screen: was dark bg + logo forced to pure white via
+      brightness(0) invert(1), which would vanish on a white panel. ------ */
+#loading { background: var(--bg); }
+.logo-badge {
+  background: linear-gradient(135deg,#0b1220,#132038);   /* keep logo legible */
+  border: 1px solid rgba(15,23,42,0.10);
+  box-shadow: 0 10px 34px rgba(15,23,42,0.16);
+}
+.logo-badge img { filter: none; }                        /* logo is already light-on-dark here */
+.loader-bar { background: rgba(15,23,42,0.07); }
+
+/* -- Table + scroll chrome ------------------------------------------------ */
+.table-wrap { background: #ffffff; }
+.data-table thead th { background: #f8fafc; }
+* { scrollbar-color: rgba(15,23,42,.26) transparent; }
+::-webkit-scrollbar-track,
+.table-wrap::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb,
+.table-wrap::-webkit-scrollbar-thumb { background: rgba(15,23,42,.24); }
+::-webkit-scrollbar-thumb:hover,
+.table-wrap::-webkit-scrollbar-thumb:hover { background: rgba(15,23,42,.38); }
+
+/* -- Sidebar / nav ------------------------------------------------------- */
+.nav-item.active {
+  background: rgba(0,71,251,.075);
+  color: var(--indigo);
+  border-color: rgba(0,71,251,.22);
+  box-shadow: none;
+  animation: none;                    /* the dark theme's breathing glow reads as flicker on white */
+}
+.nav-item.active::after { box-shadow: none; }
+.sidebar-footer .sync-dot { animation: none; box-shadow: none; }
+
+/* -- Status dots: the dark theme's heavy bloom smears on white ----------- */
+.dot-online, .dot-waiting, .dot-away, .dot-offline, .dot-stalled {
+  animation: none !important;
+  box-shadow: 0 0 0 2px rgba(15,23,42,.05) !important;
+}
+.dot-offline { background: var(--t4); }
+
+/* -- Badges / chips need more fill opacity to read on white ------------- */
+.b-green {background:rgba(5,150,105,.10); border-color:rgba(5,150,105,.30); box-shadow:none}
+.b-red   {background:rgba(220,38,38,.10); border-color:rgba(220,38,38,.30); box-shadow:none}
+.b-amber {background:rgba(180,83,9,.10);  border-color:rgba(180,83,9,.30);  box-shadow:none}
+.b-grey  {background:rgba(15,23,42,.05);  border-color:rgba(15,23,42,.16)}
+.b-indigo{background:rgba(0,71,251,.09);  border-color:rgba(0,71,251,.28);  box-shadow:none}
+.b-cyan  {background:rgba(0,135,189,.09); border-color:rgba(0,135,189,.28); box-shadow:none}
+.b-purple{background:rgba(0,135,189,.09); border-color:rgba(0,135,189,.28); box-shadow:none}
+.version-badge-ok   {box-shadow:none;background:rgba(5,150,105,.10);border-color:rgba(5,150,105,.35)}
+.version-badge-warn {box-shadow:none;background:rgba(180,83,9,.10); border-color:rgba(180,83,9,.35)}
+.version-badge-err  {box-shadow:none;background:rgba(220,38,38,.10);border-color:rgba(220,38,38,.35)}
+
+/* -- Buttons: flat brand fills read better than glowing gradients here -- */
+.btn-primary { background: var(--indigo); box-shadow: 0 1px 2px rgba(0,71,251,.22); }
+.btn-primary:hover:not(:disabled) { background: #0039C9; box-shadow: 0 2px 8px rgba(0,71,251,.30); opacity: 1; }
+.btn-cyan    { background: var(--cyan);   box-shadow: 0 1px 2px rgba(0,135,189,.22); }
+.btn-cyan:hover:not(:disabled)    { background: #006E9B; box-shadow: 0 2px 8px rgba(0,135,189,.30); opacity: 1; }
+.btn-green   { background: var(--green);  box-shadow: 0 1px 2px rgba(5,150,105,.22); }
+.btn-green:hover:not(:disabled)   { background: #047857; opacity: 1; }
+.btn-amber   { background: var(--amber);  box-shadow: 0 1px 2px rgba(180,83,9,.22); }
+.btn-amber:hover:not(:disabled)   { background: #92400E; box-shadow: none; opacity: 1; }
+.btn-red     { background: var(--red); }
+.btn-red:hover:not(:disabled)     { background: #B91C1C; opacity: 1; }
+.btn-ghost   { background: #ffffff; }
+.btn-ghost:hover:not(:disabled)   { background: #f8fafc; border-color: var(--indigo); }
+.btn-refresh { background: #ffffff; }
+.btn-refresh:hover:not(:disabled) { background: #f8fafc; box-shadow: var(--glow-indigo); }
+.btn-queued  { background:rgba(5,150,105,.10); border-color:rgba(5,150,105,.35) }
+.btn-pinged  { background:rgba(0,135,189,.10); border-color:rgba(0,135,189,.35) }
+.hotpatch-btn{ background:rgba(180,83,9,.07); border-color:rgba(180,83,9,.35) }
+.hotpatch-btn:hover{ background:var(--amber); color:#fff; box-shadow:none }
+
+/* -- Alert chips -------------------------------------------------------- */
+.alert-chip.alert-warn{background:rgba(180,83,9,.08); border-color:rgba(180,83,9,.28)}
+.alert-chip.alert-crit{background:rgba(220,38,38,.08);border-color:rgba(220,38,38,.28)}
+.alert-chip.alert-info{background:rgba(0,135,189,.08);border-color:rgba(0,135,189,.28)}
+.alert-chip.alert-ok  {background:rgba(5,150,105,.08);border-color:rgba(5,150,105,.28)}
+
+/* -- Inputs ------------------------------------------------------------- */
+input[type="text"],input[type="email"],input[type="url"],input[type="date"],textarea,select{
+  background:#ffffff; border-color:rgba(15,23,42,.16)}
+input[type="text"]:focus,input[type="email"]:focus,input[type="url"]:focus,
+input[type="date"]:focus,textarea:focus,select:focus{
+  background:#ffffff; box-shadow:0 0 0 3px rgba(0,71,251,.13)}
+.u-field input[type="date"]{color-scheme:light}      /* was forced dark */
+select option{background:#ffffff;color:var(--t1)}
+.upload-zone{background:#ffffff;border-color:rgba(15,23,42,.18)}
+.upload-zone:hover,.upload-zone.dragover{background:#f8fafc;box-shadow:none}
+
+/* -- Overlays / panels -------------------------------------------------- */
+.modal      { background: rgba(15,23,42,.45); }
+.modal-box  { background:#ffffff; box-shadow:0 24px 70px rgba(15,23,42,.22) }
+.drawer     { background:#ffffff; box-shadow:-8px 0 40px rgba(15,23,42,.14) }
+.drawer-overlay { background: rgba(15,23,42,.38); }
+.confirm-overlay{ background: rgba(15,23,42,.45); }
+.confirm-box{ background:#ffffff; box-shadow:0 20px 60px rgba(15,23,42,.22) }
+.split-pane { background:#f8fafc }
+#toast      { background:#0f172a; color:#ffffff; border-color:rgba(255,255,255,.12);
+              box-shadow:0 10px 34px rgba(15,23,42,.28) }
+#toast.err  { background:#7f1d1d; box-shadow:0 10px 34px rgba(127,29,29,.30) }
+#toast.ok   { background:#064e3b; box-shadow:0 10px 34px rgba(6,78,59,.30) }
+
+/* -- Progress tracker / timeline --------------------------------------- */
+.prog-inner  { background:rgba(0,71,251,.035); border-top-color:rgba(0,71,251,.16) }
+.prog-icon   { background:#f8fafc }
+.prog-icon.active{background:rgba(0,71,251,.12)} .prog-icon.done{background:rgba(5,150,105,.12)}
+.prog-icon.error {background:rgba(220,38,38,.12)}
+.prog-connector{background:rgba(15,23,42,.10)}
+.prog-fill   { background: var(--indigo) }
+.tl-item     { border-left-color:rgba(15,23,42,.10) }
+.tl-item::before{border-color:#ffffff}
+.tl-msg      { background:#f8fafc; border-left-color:rgba(15,23,42,.16) }
+.dev-list li:hover{background:rgba(15,23,42,.035)}
+.dev-chip    { background:#ffffff }
+.stat-box    { background:#ffffff }
+.stat-box:hover{box-shadow:var(--glow-indigo)}
+.tl-filter   { background:#ffffff }
+.tl-filter.active,.tl-filter:hover{background:rgba(0,71,251,.07)}
+.theme-pill  { background:#ffffff }
+.theme-pill.active{background:var(--indigo);color:#fff;box-shadow:none}
+.card-icon   { box-shadow:none !important }
 
 #headlineInsight { transition: border-left-color 0.3s ease; }
 #toast.show.warn { background: rgba(245,158,11,0.92); color: #1f2937; }

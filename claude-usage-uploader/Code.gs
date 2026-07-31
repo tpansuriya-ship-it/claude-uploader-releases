@@ -670,8 +670,8 @@ function ensureTriggerQueue() {
   var sheet = ss.getSheetByName('TriggerQueue');
   if (!sheet) {
     sheet = ss.insertSheet('TriggerQueue');
-    sheet.appendRow(['Name', 'QueuedAt', 'QueuedBy', 'Type', 'NotBefore']);
-    sheet.getRange(1, 1, 1, 5).setFontWeight('bold');
+    sheet.appendRow(['Name', 'QueuedAt', 'QueuedBy', 'Type', 'NotBefore', 'Since', 'Until']);
+    sheet.getRange(1, 1, 1, 7).setFontWeight('bold');
   } else {
     var lastCol = sheet.getLastColumn();
     if (lastCol < 4) {
@@ -680,8 +680,209 @@ function ensureTriggerQueue() {
     if (lastCol < 5) {
       sheet.getRange(1, 5).setValue('NotBefore').setFontWeight('bold');
     }
+    // v5.5: DATED_RUN carries an explicit reporting window. Added additively so
+    // an existing queue keeps working untouched — every reader below defaults a
+    // missing Since/Until to '' and behaves exactly as before.
+    if (lastCol < 6) {
+      sheet.getRange(1, 6).setValue('Since').setFontWeight('bold');
+    }
+    if (lastCol < 7) {
+      sheet.getRange(1, 7).setValue('Until').setFontWeight('bold');
+    }
   }
   return sheet;
+}
+
+// ================================================================
+// v5.5 — ON-DEMAND (BACKDATED) REPORTS
+// ================================================================
+// Requirement: pick a person and a date, pull that period's report from THEIR
+// machine, and download it from the dashboard.
+//
+// Verified before building (2026-07-31): Claude Code retains ~4 months of local
+// session logs and does not prune them, and the bundled ccusage supports
+// `--since`/`--until`, so a specific past day is genuinely recoverable rather
+// than a best-effort guess. What it cannot do is invent data for a day the
+// person did not use Claude — an empty result means "no usage that day".
+//
+// Filenames deliberately DO NOT end in _claude_daily.json / _claude_session.json.
+// The weekly archive and the hourly mirror both match on that exact suffix, so
+// an ad-hoc pull would otherwise be swept into the Mon–Sun weekly folders and
+// corrupt the compliance record. The _ondemand_ infix keeps the two streams
+// completely separate.
+var ONDEMAND_FOLDER_NAME = 'On-Demand Reports';
+var ONDEMAND_FILE_RE = /_claude_(daily|session)_ondemand_[0-9-]+_to_[0-9-]+\.json$/i;
+
+// Queue a dated report pull for one developer. Their agent picks it up on its
+// next poll (so the machine must be online), runs a date-scoped ccusage, and
+// uploads a separately-named file.
+function adminQueueDatedReport(name, sinceIso, untilIso) {
+  requireAdmin_();
+  name = String(name || '').trim();
+  if (!name) return { success: false, error: 'Developer is required' };
+
+  var since = String(sinceIso || '').trim();
+  var until = String(untilIso || '').trim();
+  if (!isIsoDateOnly_(since) || !isIsoDateOnly_(until)) {
+    return { success: false, error: 'Both dates must be yyyy-MM-dd.' };
+  }
+  if (since > until) { var s = since; since = until; until = s; }
+
+  // A future window can never contain data — reject rather than queue a run
+  // that is guaranteed to come back empty and look like a failure.
+  var todayIso = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Kolkata', 'yyyy-MM-dd');
+  if (since > todayIso) {
+    return { success: false, error: 'That start date is in the future (' + since + ').' };
+  }
+
+  var hit = findRosterRow_(name);
+  if (!hit) return { success: false, error: name + ' is not in the roster' };
+  if (normalizeUserStatus_(hit.row[REG_COL_STATUS]) === USER_STATUS.REMOVED) {
+    return {
+      success: false,
+      error: name + ' is Removed, so their agent is paused and will never pick this up. ' +
+             'Restore them first if you need a fresh pull.'
+    };
+  }
+  if (isDeveloperPaused_(SpreadsheetApp.getActiveSpreadsheet(), name)) {
+    return { success: false, error: name + ' is paused — their agent ignores triggers until resumed.' };
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return { success: false, error: 'Lock timeout: the fleet is busy. Try again in a moment.' };
+  }
+  try {
+    var sheet = ensureTriggerQueue();
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim().toLowerCase() === name.toLowerCase()) {
+        return {
+          success: false,
+          error: 'A trigger is already queued for ' + name +
+                 '. Wait for it to run, or cancel it on the Queue & Runs page.'
+        };
+      }
+    }
+    var who = '';
+    try { who = Session.getActiveUser().getEmail(); } catch (e) { who = 'admin'; }
+    sheet.appendRow([name, new Date().toISOString(), who, 'DATED_RUN',
+                     new Date().toISOString(), since, until]);
+    SpreadsheetApp.flush();
+    log_('OnDemand: queued DATED_RUN for ' + name + ' (' + since + ' to ' + until + ') by ' + who);
+    invalidateCache_();
+    return {
+      success: true, name: name, since: since, until: until,
+      note: 'Queued. Their agent picks this up within ~60 seconds of its next poll, ' +
+            'then generates and uploads. Refresh the list in a couple of minutes.'
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Find-or-create the On-Demand Reports folder inside the nominated reports folder.
+function ensureOnDemandFolder_() {
+  var parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+  var it = parent.getFoldersByName(ONDEMAND_FOLDER_NAME);
+  if (it.hasNext()) return it.next();
+  var created = parent.createFolder(ONDEMAND_FOLDER_NAME);
+  log_('OnDemand: created "' + ONDEMAND_FOLDER_NAME + '" folder');
+  return created;
+}
+
+// Copy any on-demand files the agents have uploaded into the On-Demand Reports
+// folder. Runs from the same hourly job as the live mirror, and is also called
+// directly by the dashboard so a fresh pull appears without waiting an hour.
+function syncOnDemandReports_() {
+  var out = { copied: [], skipped: [], failed: [] };
+  var dest;
+  try { dest = ensureOnDemandFolder_(); }
+  catch (e) { out.error = 'Cannot open the On-Demand folder: ' + e.toString(); return out; }
+
+  var existing = {};
+  var exIt = dest.getFiles();
+  while (exIt.hasNext()) {
+    var ex = exIt.next();
+    if (!ex.isTrashed()) existing[ex.getName()] = ex.getLastUpdated().getTime();
+  }
+
+  archiveSourceFolderIds_().forEach(function(sid) {
+    var src;
+    try { src = DriveApp.getFolderById(sid); } catch (e) { return; }
+    var it = src.getFiles();
+    while (it.hasNext()) {
+      var f = it.next();
+      if (f.isTrashed()) continue;
+      var fn = f.getName();
+      if (!ONDEMAND_FILE_RE.test(fn)) continue;
+      var upd = f.getLastUpdated().getTime();
+      if (existing[fn] && upd <= existing[fn] + 1000) { out.skipped.push(fn); continue; }
+      try {
+        if (existing[fn]) {
+          var old = dest.getFilesByName(fn);
+          while (old.hasNext()) old.next().setTrashed(true);
+        }
+        f.makeCopy(fn, dest);
+        out.copied.push(fn);
+      } catch (e) {
+        out.failed.push({ file: fn, error: e.toString() });
+      }
+    }
+  });
+  if (out.copied.length) log_('OnDemand: mirrored ' + out.copied.length + ' file(s)');
+  return out;
+}
+
+// Everything currently available for download, newest first. Powers the
+// dashboard list. Parses the window back out of the filename so the UI can show
+// what period each file actually covers.
+function listOnDemandReports() {
+  requireAdmin_();
+  // Pull anything new across before listing, so a report that finished seconds
+  // ago is visible immediately rather than on the next hourly tick.
+  var synced = syncOnDemandReports_();
+
+  var out = [];
+  try {
+    var folder = ensureOnDemandFolder_();
+    var it = folder.getFiles();
+    while (it.hasNext()) {
+      var f = it.next();
+      if (f.isTrashed()) continue;
+      var fn = f.getName();
+      var m = fn.match(/^(.*)_claude_(daily|session)_ondemand_([0-9-]+)_to_([0-9-]+)\.json$/i);
+      if (!m) continue;
+      out.push({
+        fileName: fn,
+        developer: m[1],
+        type: m[2].toLowerCase(),
+        since: m[3],
+        until: m[4],
+        sizeBytes: f.getSize(),
+        // A 200-byte file is ccusage's empty shell — flag it so an admin is not
+        // left wondering why a "successful" report contains nothing.
+        looksEmpty: f.getSize() < 400,
+        generatedIso: f.getLastUpdated().toISOString(),
+        url: f.getUrl(),
+        downloadUrl: 'https://drive.google.com/uc?export=download&id=' + f.getId()
+      });
+    }
+  } catch (e) {
+    return { error: e.toString(), reports: [] };
+  }
+  out.sort(function(a, b) { return b.generatedIso.localeCompare(a.generatedIso); });
+  return { reports: out, count: out.length, justSynced: synced.copied.length };
+}
+
+function logQueueDatedReportExample() {
+  // Edit the three values then Run, if you prefer the editor over the dashboard.
+  Logger.log(JSON.stringify(
+    adminQueueDatedReport('Hitarth_Desai', '2026-06-08', '2026-06-08'), null, 2));
+}
+
+function logOnDemandReports() {
+  Logger.log(JSON.stringify(listOnDemandReports(), null, 2));
 }
 
 // -------------------- TRIGGER QUEUE --------------------
@@ -714,10 +915,21 @@ function adminQueueTrigger(name, type) {
   }
 }
 
-// Bulk-queue FORCE_RUN for multiple developers in one lock acquisition.
+// Bulk-queue triggers for multiple developers in ONE lock acquisition.
 // Skips names already in the queue. Returns { queued: [], skipped: [] }.
-function adminQueueTriggerBatch(names) {
+//
+// `type` defaults to FORCE_RUN for the original caller (bulk force-run). Also
+// used for bulk UPDATE (Version Matrix "Force update N outdated") — see the
+// 2026-07-30 fix note on forceSendUpdateBatch: that endpoint used to call
+// adminQueueTrigger() once PER developer, meaning a 26-person bulk update took
+// the whole-script lock 26 separate times. With ~20 agents heartbeating
+// concurrently (each heartbeat briefly takes the same lock for its own
+// smart-retry/auto-generate check), that many individual acquisitions reliably
+// produced "Lock timeout" failures partway through a bulk operation. One
+// acquisition for the entire batch removes 25 of those 26 contention points.
+function adminQueueTriggerBatch(names, type) {
   requireAdmin_();
+  type = type || 'FORCE_RUN';
   if (!names || !names.length) return { queued: [], skipped: [] };
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
@@ -736,15 +948,17 @@ function adminQueueTriggerBatch(names) {
       if (alreadyQueued[key]) {
         skipped.push(name);
       } else {
-        // Stagger each trigger by 60s to prevent simultaneous GAS executions
+        // Stagger 60s apart — for FORCE_RUN this avoids simultaneous GAS
+        // executions; for UPDATE it avoids a stampede of ~72MB downloads and
+        // Drive/GAS calls all firing in the same instant.
         var notBefore = new Date(baseTime + queued.length * 60000).toISOString();
-        sheet.appendRow([name.trim(), new Date().toISOString(), who, 'FORCE_RUN', notBefore]);
+        sheet.appendRow([name.trim(), new Date().toISOString(), who, type, notBefore]);
         queued.push(name);
         alreadyQueued[key] = true;
       }
     });
     if (queued.length > 0) {
-      log_('TriggerQueue: batch queued ' + queued.length + ' FORCE_RUN(s) by ' + who);
+      log_('TriggerQueue: batch queued ' + queued.length + ' ' + type + '(s) by ' + who);
       invalidateCache_();
     }
     return { queued: queued, skipped: skipped };
@@ -862,6 +1076,215 @@ function getUploadDriveFolderInfo() {
   return out;
 }
 
+// ---------- FLEET UPLOAD FOLDER: ONE-CLICK OPERATIONS ----------
+// The Apps Script editor cannot pass arguments to a Run, so setUploadDriveFolderId
+// is unreachable from the UI on its own. Edit the constant below, then run the
+// wrappers in order:
+//   1. logPreflightUploadFolder   — is it safe? (does NOT change anything)
+//   2. logSetFleetUploadFolder    — switch the fleet over
+//   3. logUploadFolderInfo        — confirm what is live
+//   4. logRevertFleetUploadFolder — undo, back to the compiled folder
+var SETUP_FLEET_UPLOAD_FOLDER = '1ss0gkNQPjFRoqRLp2zmGV7SEUp5tbzVu';
+
+// The identity the AGENTS use for Drive — from service-account-key.json, which
+// ships beside each executable. This script runs as a completely different
+// account, which is why "the dashboard can see the folder" proves nothing about
+// whether uploads will work. Checked explicitly in the preflight below.
+var UPLOADER_SERVICE_ACCOUNT_EMAIL = 'claude-uploader@claude-usage-auto-uploader.iam.gserviceaccount.com';
+
+// Read-only. Answers the only question that matters before switching: will the
+// agents actually be able to write there? Changes nothing.
+function preflightUploadFolder(folderId) {
+  requireAdmin_();
+  var id = String(folderId || SETUP_FLEET_UPLOAD_FOLDER || '').trim();
+  var m = id.match(/\/folders\/([A-Za-z0-9_-]{10,80})/);
+  if (m) id = m[1];
+  var out = { folderId: id, serviceAccount: UPLOADER_SERVICE_ACCOUNT_EMAIL, blockers: [], warnings: [] };
+
+  if (!/^[A-Za-z0-9_-]{10,80}$/.test(id)) {
+    out.blockers.push('"' + id + '" is not a Drive folder ID or URL.');
+    out.verdict = 'BLOCKED. ' + out.blockers[0];
+    return out;
+  }
+
+  var folder;
+  try {
+    folder = DriveApp.getFolderById(id);
+    out.folderName = folder.getName();
+    out.scriptCanRead = true;
+  } catch (e) {
+    out.scriptCanRead = false;
+    out.blockers.push('This script cannot open the folder: ' + e.toString());
+    out.verdict = 'BLOCKED. The dashboard cannot see this folder, so it could never archive from it.';
+    return out;
+  }
+
+  // Can THIS script write? Needed for the weekly archive, not for the uploads.
+  try {
+    var probe = folder.createFolder('__preflight_probe_' +
+      Utilities.formatDate(new Date(), 'UTC', 'yyyyMMdd_HHmmss'));
+    probe.setTrashed(true);
+    out.scriptCanWrite = true;
+  } catch (e) {
+    out.scriptCanWrite = false;
+    out.warnings.push('This script cannot WRITE here, so weekly dated folders could not be created ' +
+                      'inside it. Uploads may still work — these are different accounts.');
+  }
+
+  // THE decisive check: is the agents' service account actually an editor?
+  // Direct sharing shows up in getEditors(); access inherited from a shared-drive
+  // membership does not, so a negative result is "unproven", never "definitely broken".
+  out.serviceAccountIsEditor = null;
+  try {
+    var emails = folder.getEditors().map(function(u) { return String(u.getEmail() || '').toLowerCase(); });
+    var owner = '';
+    try { owner = String(folder.getOwner().getEmail() || '').toLowerCase(); } catch (e2) {}
+    if (owner) emails.push(owner);
+    out.editorsVisible = emails.length;
+    out.serviceAccountIsEditor = emails.indexOf(UPLOADER_SERVICE_ACCOUNT_EMAIL.toLowerCase()) !== -1;
+    if (!out.serviceAccountIsEditor) {
+      out.blockers.push('The uploader service account is NOT listed as an editor on this folder. ' +
+        'Share the folder with ' + UPLOADER_SERVICE_ACCOUNT_EMAIL + ' as Editor first, or every ' +
+        'upload will fail with 404 and each agent will silently fall back to the old folder.');
+    }
+  } catch (e) {
+    out.warnings.push('Could not list the folder permissions (' + e.toString() + '), so the ' +
+                      'service account access is UNVERIFIED. Confirm it manually in Drive > Share.');
+  }
+
+  out.verdict = out.blockers.length === 0
+    ? (out.warnings.length === 0
+        ? 'READY. ' + UPLOADER_SERVICE_ACCOUNT_EMAIL + ' can write to "' + out.folderName +
+          '". Run logSetFleetUploadFolder to switch the fleet.'
+        : 'READY WITH WARNINGS — read them, then run logSetFleetUploadFolder.')
+    : 'NOT READY. ' + out.blockers[0];
+  return out;
+}
+
+function logPreflightUploadFolder() {
+  Logger.log(JSON.stringify(preflightUploadFolder(), null, 2));
+}
+
+// Switches every v2.0.7+ agent to SETUP_FLEET_UPLOAD_FOLDER on its next poll.
+// Refuses to run if the preflight found a hard blocker — a wrong value here
+// reaches the whole fleet within a minute.
+function logSetFleetUploadFolder() {
+  var pre = preflightUploadFolder();
+  if (pre.blockers && pre.blockers.length > 0) {
+    Logger.log(JSON.stringify({
+      aborted: true,
+      reason: 'Preflight found blocker(s) — nothing was changed.',
+      blockers: pre.blockers,
+      preflight: pre
+    }, null, 2));
+    return;
+  }
+  var result = setUploadDriveFolderId(SETUP_FLEET_UPLOAD_FOLDER);
+  // setUploadDriveFolderId carries a standing warning that it cannot verify the
+  // service account — true when called directly, but the preflight above just
+  // verified exactly that. Leaving the warning in place next to a
+  // serviceAccountIsEditor:true reads as "you still have work to do", so resolve it.
+  if (pre.serviceAccountIsEditor === true) {
+    result.criticalCaveat = 'RESOLVED by preflight: ' + UPLOADER_SERVICE_ACCOUNT_EMAIL +
+      ' is confirmed as an editor on this folder, so agent uploads will not 404.';
+  } else if (pre.serviceAccountIsEditor === null) {
+    result.criticalCaveat = 'UNVERIFIED: the folder permissions could not be listed, so it is ' +
+      'still unproven that ' + UPLOADER_SERVICE_ACCOUNT_EMAIL + ' can write here. If uploads ' +
+      'start failing, each agent logs CRITICAL and falls back to its compiled folder — ' +
+      'reports keep arriving, in the old location.';
+  }
+  result.preflight = pre;
+  Logger.log(JSON.stringify(result, null, 2));
+}
+
+function logUploadFolderInfo() {
+  Logger.log(JSON.stringify(getUploadDriveFolderInfo(), null, 2));
+}
+
+// After switching the fleet upload folder, the question is always the same:
+// are uploads landing in the new place, failing, or quietly still going to the
+// old one? The agents report the answer in their FAILURE messages, but those are
+// buried in ComplianceLog. This pulls them out verbatim.
+//
+// Reads only — safe to run any time.
+function diagnoseRecentUploads(hoursBack) {
+  requireAdmin_();
+  var hours = parseInt(hoursBack, 10);
+  if (!isFinite(hours) || hours <= 0 || hours > 168) hours = 24;
+  var cutoff = Date.now() - hours * 3600000;
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('ComplianceLog');
+  var out = {
+    windowHours: hours,
+    configuredUploadFolder: getSetting_(UPLOAD_FOLDER_SETTING_KEY, '') || '(compiled default)',
+    compiledDefaultFolder: SHARED_DRIVE_FOLDER_ID,
+    statusCounts: {},
+    failures: [],
+    successes: [],
+    distinctErrorKinds: {}
+  };
+  if (!sheet) { out.error = 'No ComplianceLog sheet.'; return out; }
+
+  var rows = getRecentLogRows_(sheet, 3000);
+  for (var i = rows.length - 1; i >= 0; i--) {
+    var ts = rows[i][0];
+    var tms = (ts && typeof ts.getTime === 'function') ? ts.getTime() : new Date(String(ts)).getTime();
+    if (!isFinite(tms) || tms < cutoff) continue;
+
+    var status = String(rows[i][3] || '').trim().toUpperCase();
+    var name   = String(rows[i][1] || '').trim();
+    var msg    = String(rows[i][4] || '');
+    out.statusCounts[status] = (out.statusCounts[status] || 0) + 1;
+
+    if (status === 'FAILURE' && out.failures.length < 25) {
+      out.failures.push({ name: name, at: new Date(tms).toISOString(), message: msg.substring(0, 300) });
+      // Group by the error CODE the client emits (DRIVE_UPLOAD_FAILED etc.) plus
+      // the Drive reason, so one glance shows whether it is one fault or many.
+      var kind = (msg.match(/[A-Z][A-Z_]{6,}/) || ['UNCLASSIFIED'])[0];
+      var reason = (msg.match(/storageQuotaExceeded|insufficientFilePermissions|insufficientPermissions|notFound|File not found|forbidden|401|403|404|429/i) || [''])[0];
+      var key = kind + (reason ? ' / ' + reason : '');
+      out.distinctErrorKinds[key] = (out.distinctErrorKinds[key] || 0) + 1;
+    }
+    if (status === 'SUCCESS' && out.successes.length < 15) {
+      out.successes.push({ name: name, at: new Date(tms).toISOString(), message: msg.substring(0, 200) });
+    }
+  }
+
+  // The decisive interpretation, spelled out so it does not need decoding.
+  var quota = 0;
+  Object.keys(out.distinctErrorKinds).forEach(function(k) {
+    if (/storageQuotaExceeded/i.test(k)) quota += out.distinctErrorKinds[k];
+  });
+  if (quota > 0) {
+    out.verdict = 'STORAGE QUOTA FAILURE (' + quota + ' occurrence(s)). The service account has no ' +
+      'Drive storage of its own, so it CANNOT create files in an ordinary My Drive folder — only in a ' +
+      'Shared Drive, where the drive owns the files. The configured upload folder must be moved into a ' +
+      'Shared Drive, or the fleet pointed back at the compiled default.';
+  } else if ((out.statusCounts.SUCCESS || 0) > 0 && (out.statusCounts.FAILURE || 0) === 0) {
+    out.verdict = 'Uploads are SUCCEEDING (' + out.statusCounts.SUCCESS + ' in the last ' + hours +
+      'h) with no failures. If the new folder still looks empty, the agents are writing to the OLD ' +
+      'folder — meaning they have not applied the new setting yet (check their reported version is 2.0.7 ' +
+      'and that they have polled since the change).';
+  } else if ((out.statusCounts.FAILURE || 0) > 0) {
+    out.verdict = out.statusCounts.FAILURE + ' failure(s) in the last ' + hours +
+      'h. Read distinctErrorKinds and failures[].message below — the Drive reason string names the cause.';
+  } else {
+    out.verdict = 'No SUCCESS or FAILURE rows in this window. Widen it: diagnoseRecentUploads(72).';
+  }
+  return out;
+}
+
+function logRecentUploads() {
+  Logger.log(JSON.stringify(diagnoseRecentUploads(24), null, 2));
+}
+
+// Undo: clears the setting so every agent returns to the folder compiled into
+// its binary. Takes effect on the next poll.
+function logRevertFleetUploadFolder() {
+  Logger.log(JSON.stringify(setUploadDriveFolderId(''), null, 2));
+}
+
 function checkAndClearTrigger(name) {
   if (!name) return { triggered: false, paused: false };
 
@@ -911,11 +1334,17 @@ function checkAndClearTrigger(name) {
         var nb2 = data[i][4] ? String(data[i][4]).trim() : '';
         if (nb2 && new Date(nb2) > now2) continue; // not yet ready
         var triggerType = data[i][3] ? String(data[i][3]).trim() : 'FORCE_RUN';
+        // v5.5: DATED_RUN carries the reporting window in cols 6/7. Sent as
+        // `since`/`until` so the agent can scope ccusage to that exact period.
+        var since = data[i][5] ? String(data[i][5]).trim() : '';
+        var until = data[i][6] ? String(data[i][6]).trim() : '';
         qSheet.deleteRow(i + 1);
         SpreadsheetApp.flush();  // commit immediately so concurrent readers see it gone
-        log_('TriggerQueue: consumed ' + triggerType + ' for ' + name);
+        log_('TriggerQueue: consumed ' + triggerType + ' for ' + name +
+             (since ? ' (' + since + ' to ' + until + ')' : ''));
         invalidateCache_();
-        return { triggered: true, type: triggerType, paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
+        return { triggered: true, type: triggerType, since: since, until: until,
+                 paused: paused, uploadFrequency: uploadFrequency, uploadSchedule: uploadSchedule, driveFolderId: driveFolderId };
       }
     }
     // Trigger was claimed by a concurrent request between the cache-check and lock acquisition.
@@ -1762,11 +2191,47 @@ function checkAndTriggerSmartRetry_(name) {
 // Skips users that are paused, already have a pending trigger, or have
 // already successfully uploaded today.
 //
-// State lives entirely in CacheService (auto-expires at 24h), so there's no
-// permanent state to clean up and no risk of bloating Script Properties.
+// CHANGED 2026-07-31 — DAILY -> WEEKLY (Mon 00:00 IST to Sun 23:59 IST).
+//
+// Requirement: one report per person per reporting week, not one per day. A
+// machine that comes online at any point during the week gets its report
+// generated 10 minutes later; a machine already counted for that week is left
+// alone until the next Monday rolls over.
+//
+// The "already generated" flag MOVED from CacheService to ScriptProperties, and
+// that move is required, not cosmetic. Apps Script caps CacheService expiry at
+// 21600s (6 hours) — the old `23 * 3600` was silently clamped to 6h, so the
+// supposedly once-a-day guard actually lapsed four times a day and re-queued
+// each person repeatedly. (That is why a quiet fleet was still logging hundreds
+// of uploads per day.) A week is 168 hours, so cache cannot express it at all;
+// ScriptProperties has no TTL and holds the state properly.
+//
+// Storage shape is ONE property holding {name: weekStart}, not one property per
+// person, so it stays a couple of KB for the whole fleet and prunes itself as
+// weeks roll over — no unbounded Properties growth.
+var AUTOGEN_DELAY_MS = 10 * 60 * 1000;  // 10 minutes after first heartbeat of the week
+var AUTOGEN_FIRSTSEEN_TTL_S = 6 * 3600; // cache only holds the short first-seen mark
+var WEEKLY_GEN_STATE_KEY = 'weeklyGenQueued';
 
-var AUTOGEN_DELAY_MS = 10 * 60 * 1000;  // 10 minutes after first heartbeat of the day
-var AUTOGEN_DEDUP_TTL_S = 23 * 3600;    // cache TTL just under 24h so a new day re-fires
+// {lowercaseName: 'yyyy-MM-dd' weekStart} — the week each person was last queued for.
+function getWeeklyGenState_() {
+  try {
+    return JSON.parse(PropertiesService.getScriptProperties()
+      .getProperty(WEEKLY_GEN_STATE_KEY) || '{}');
+  } catch (e) { return {}; }
+}
+
+// Records that `name` has been handled for `weekStart`, and drops entries from
+// any earlier week so this can never grow without bound.
+function markWeeklyGenQueued_(name, weekStart) {
+  var state = getWeeklyGenState_();
+  state[String(name).trim().toLowerCase()] = weekStart;
+  Object.keys(state).forEach(function(k) {
+    if (state[k] !== weekStart) delete state[k];
+  });
+  PropertiesService.getScriptProperties()
+    .setProperty(WEEKLY_GEN_STATE_KEY, JSON.stringify(state));
+}
 
 function getAutoGenerateEnabled_() {
   try {
@@ -1786,7 +2251,10 @@ function getAutoGenerateStatus() {
   return {
     enabled: getAutoGenerateEnabled_(),
     delayMinutes: Math.round(AUTOGEN_DELAY_MS / 60000),
-    description: 'When a developer is first seen online each day, a FORCE_RUN is queued 10 min later so their report uploads automatically.'
+    cadence: 'weekly (Mon 00:00 - Sun 23:59 ' + (Session.getScriptTimeZone() || 'Asia/Kolkata') + ')',
+    description: 'Once per reporting week, 10 minutes after a developer first comes online that week, ' +
+                 'a FORCE_RUN is queued so their weekly report uploads automatically. Someone who ' +
+                 'only powers on later in the week still gets captured whenever they appear.'
   };
 }
 
@@ -1795,28 +2263,32 @@ function maybeQueueDailyAutoGenerate_(name) {
   if (!name || name === 'UNKNOWN') return;
 
   var cache = CacheService.getScriptCache();
-  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  var weekStart = getCurrentWeekStart_();          // Monday of the current week, script tz
   var lower = name.trim().toLowerCase();
-  var firstSeenKey = 'autogen_firstseen_' + today + '_' + lower;
-  var queuedKey    = 'autogen_queued_'    + today + '_' + lower;
+  var firstSeenKey = 'autogen_firstseen_' + weekStart + '_' + lower;
 
-  // Already queued today? — nothing to do
-  if (cache.get(queuedKey)) return;
+  // Already generated for THIS week? Nothing more to do until Monday rolls over.
+  // Read from ScriptProperties, not cache — a week outlives any cache entry.
+  var weeklyState = getWeeklyGenState_();
+  if (weeklyState[lower] === weekStart) return;
 
   var now = Date.now();
   var firstSeenStr = cache.get(firstSeenKey);
   if (!firstSeenStr) {
-    // First heartbeat we've observed today for this user — record and wait
-    cache.put(firstSeenKey, String(now), AUTOGEN_DEDUP_TTL_S);
+    // First heartbeat observed for this person this week — record and wait out
+    // the 10-minute stabilisation window before generating.
+    cache.put(firstSeenKey, String(now), AUTOGEN_FIRSTSEEN_TTL_S);
     return;
   }
   var firstSeen = parseInt(firstSeenStr, 10);
-  if (!isFinite(firstSeen) || now - firstSeen < AUTOGEN_DELAY_MS) return; // still within the 10-min stabilisation window
+  if (!isFinite(firstSeen) || now - firstSeen < AUTOGEN_DELAY_MS) return; // still stabilising
 
   // Cheap pre-checks before grabbing the script lock
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   if (isDeveloperPaused_(ss, name)) {
-    cache.put(queuedKey, '1', AUTOGEN_DEDUP_TTL_S); // mark so we don't re-check each heartbeat
+    // Paused/removed people are deliberately silent — mark them done for the
+    // week so every subsequent heartbeat skips this whole check.
+    markWeeklyGenQueued_(name, weekStart);
     return;
   }
 
@@ -1824,30 +2296,31 @@ function maybeQueueDailyAutoGenerate_(name) {
   var queueRows = getTriggerQueueRowsCached_();
   for (var q = 0; q < queueRows.length; q++) {
     if (queueRows[q].name.toLowerCase() === lower) {
-      cache.put(queuedKey, '1', AUTOGEN_DEDUP_TTL_S);
+      markWeeklyGenQueued_(name, weekStart);
       return;
     }
   }
 
-  // Skip if developer already uploaded successfully today (avoids duplicate runs)
+  // Skip if they already have a successful upload recorded for THIS reporting
+  // week. ComplianceLog's Week Start column is written by doPost from the same
+  // getCurrentWeekStart_(), so comparing against it is exact.
   var logSheet = ss.getSheetByName('ComplianceLog');
   if (logSheet) {
-    var logData = getRecentLogRows_(logSheet, 200);
-    var todayPrefix = today; // YYYY-MM-DD
+    var logData = getRecentLogRows_(logSheet, 3000);
     for (var i = 0; i < logData.length; i++) {
       var row = logData[i];
       if (!row[0]) continue;
       var rName = String(row[1] || '').trim().toLowerCase();
       if (rName !== lower) continue;
-      var status = String(row[3] || '').trim().toUpperCase();
-      if (status !== 'SUCCESS') continue;
-      var ts = row[0];
-      var tsStr = (ts && typeof ts.toISOString === 'function')
-        ? Utilities.formatDate(ts, Session.getScriptTimeZone(), 'yyyy-MM-dd')
-        : String(ts).substring(0, 10);
-      if (tsStr === todayPrefix) {
-        // Already uploaded today — mark queued so we don't re-check until tomorrow
-        cache.put(queuedKey, '1', AUTOGEN_DEDUP_TTL_S);
+      if (String(row[3] || '').trim().toUpperCase() !== 'SUCCESS') continue;
+      var ws = row[2];
+      if (ws && typeof ws.getTime === 'function') {
+        ws = Utilities.formatDate(ws, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      } else {
+        ws = String(ws || '').trim();
+      }
+      if (ws === weekStart) {
+        markWeeklyGenQueued_(name, weekStart);
         return;
       }
     }
@@ -1857,25 +2330,48 @@ function maybeQueueDailyAutoGenerate_(name) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) return;
   try {
-    // Re-check queue inside the lock
+    // Re-check inside the lock: both the queue AND the weekly flag, since a
+    // concurrent heartbeat for the same person may have just claimed it.
+    if (getWeeklyGenState_()[lower] === weekStart) return;
     var qSheet = ensureTriggerQueue();
     var freshData = qSheet.getDataRange().getValues();
     for (var j = 1; j < freshData.length; j++) {
       if (String(freshData[j][0]).trim().toLowerCase() === lower) {
-        cache.put(queuedKey, '1', AUTOGEN_DEDUP_TTL_S);
+        markWeeklyGenQueued_(name, weekStart);
         return;
       }
     }
-    var who = 'system:autoDaily';
+    var who = 'system:autoWeekly';
     var notBefore = new Date().toISOString();
     qSheet.appendRow([name.trim(), new Date().toISOString(), who, 'FORCE_RUN', notBefore]);
     SpreadsheetApp.flush();
-    cache.put(queuedKey, '1', AUTOGEN_DEDUP_TTL_S);
-    log_('AutoDaily: queued FORCE_RUN for ' + name + ' (first online today ' + Math.round((now - firstSeen) / 60000) + ' min ago)');
+    markWeeklyGenQueued_(name, weekStart);
+    log_('AutoWeekly: queued FORCE_RUN for ' + name + ' (week of ' + weekStart +
+         ', first online ' + Math.round((now - firstSeen) / 60000) + ' min ago)');
     invalidateCache_();
   } finally {
     lock.releaseLock();
   }
+}
+
+// Admin escape hatch: clears the "already generated this week" flags so the
+// next heartbeat from each person re-queues them. Use after fixing a systemic
+// problem mid-week when you want everyone to report again without waiting for
+// Monday, instead of clicking Generate 77 times.
+function adminResetWeeklyGenerationFlags() {
+  requireAdmin_();
+  var before = Object.keys(getWeeklyGenState_()).length;
+  PropertiesService.getScriptProperties().deleteProperty(WEEKLY_GEN_STATE_KEY);
+  log_('AutoWeekly: cleared ' + before + ' weekly-generation flag(s) by admin request');
+  return {
+    success: true,
+    cleared: before,
+    note: 'Each person re-generates ~10 minutes after their next heartbeat.'
+  };
+}
+
+function logResetWeeklyGenerationFlags() {
+  Logger.log(JSON.stringify(adminResetWeeklyGenerationFlags(), null, 2));
 }
 
 // -------------------- WEBHOOK (POST) --------------------
@@ -3029,11 +3525,52 @@ var ARCHIVE_GRACE_DAYS = 10;
 // Stop before Apps Script's 6-minute ceiling and let the next daily run resume.
 var ARCHIVE_TIME_BUDGET_MS = 4 * 60 * 1000;
 
+// Every folder the fleet might currently be uploading into.
+//
+// A version-mixed fleet writes to TWO places at once: v2.0.7+ agents use the
+// folder configured on the dashboard, while older agents keep using the one
+// compiled into their binary. Both must be archived or half the fleet vanishes
+// from the weekly history. Returns the configured folder first (when set), then
+// the compiled default, de-duplicated.
+function archiveSourceFolderIds_() {
+  var ids = [];
+  // Read the sheet directly, not the cache: the archive runs from a time-driven
+  // trigger where a stale 10-minute cache entry could point at the wrong folder.
+  var configured = '';
+  try { configured = String(getSetting_(UPLOAD_FOLDER_SETTING_KEY, '') || '').trim(); } catch (e) {}
+  if (configured) ids.push(configured);
+  if (ids.indexOf(SHARED_DRIVE_FOLDER_ID) === -1) ids.push(SHARED_DRIVE_FOLDER_ID);
+  return ids;
+}
+
 // Verify the script can actually write to the archive parent BEFORE anything
 // depends on it. Drive failures here are silent and easy to miss otherwise.
 function checkWeeklyArchiveAccess() {
   requireAdmin_();
   var out = { parentFolderId: WEEKLY_ARCHIVE_PARENT_ID };
+
+  // Report every folder the snapshot will read from, and whether it can be read.
+  // A source the script cannot open is the failure mode that silently drops a
+  // whole cohort of agents from the archive, so surface it here rather than
+  // leaving it to be discovered in a log weeks later.
+  out.sourceFolders = archiveSourceFolderIds_().map(function(sid) {
+    var entry = { folderId: sid, isCompiledDefault: sid === SHARED_DRIVE_FOLDER_ID };
+    try {
+      var sf = DriveApp.getFolderById(sid);
+      entry.folderName = sf.getName();
+      entry.canRead = true;
+      var c = 0;
+      var it = sf.getFiles();
+      while (it.hasNext()) { if (/_claude_(daily|session)\.json$/i.test(it.next().getName())) c++; }
+      entry.reportFilesPresent = c;
+    } catch (e) {
+      entry.canRead = false;
+      entry.error = e.toString();
+      entry.fix = 'Share this folder with the Apps Script owner account (Editor), ' +
+                  'or agents uploading here will be missing from every weekly folder.';
+    }
+    return entry;
+  });
   try {
     var parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
     out.parentFolderName = parent.getName();
@@ -3054,7 +3591,13 @@ function checkWeeklyArchiveAccess() {
       .createFolder('__write_probe_' + Utilities.formatDate(new Date(), 'UTC', 'yyyyMMdd_HHmmss'));
     probe.setTrashed(true);
     out.canWrite = true;
-    out.verdict = 'READY. The script can create dated folders in "' + out.parentFolderName + '".';
+    var badSources = out.sourceFolders.filter(function(s) { return !s.canRead; });
+    out.verdict = badSources.length === 0
+      ? 'READY. The script can create dated folders in "' + out.parentFolderName + '", and can ' +
+        'read all ' + out.sourceFolders.length + ' upload folder(s) the fleet writes to.'
+      : 'PARTIAL. Dated folders can be created, but ' + badSources.length + ' of ' +
+        out.sourceFolders.length + ' upload folder(s) cannot be read — agents uploading there ' +
+        'will be MISSING from every weekly folder. Fix: ' + badSources[0].fix;
   } catch (e) {
     out.canWrite = false;
     out.error = e.toString();
@@ -3074,16 +3617,36 @@ function snapshotWeeklyReports(weekStartIso, weekEndIso) {
   var started = Date.now();
   var report = {
     period: win, folderName: win.label,
-    copied: [], refreshed: [], skipped: [], failed: [],
+    copied: [], refreshed: [], skipped: [], movedToCurrentWeek: [], failed: [],
     timedOut: false
   };
 
-  var parent, source;
+  // Fixed 2026-07-30: is `win` itself the week in progress, or an already-closed
+  // one? Only a CLOSED week gets the "stop touching this person once they show
+  // up in the current week" treatment below — snapshotting the current week
+  // (which the daily archive job never does on its own, but this function's
+  // signature allows arbitrary dates) must never skip against itself.
+  var isClosedWeek = win.weekStart !== getCurrentWeekStart_();
+  var currentWeekFileNames = {};
+  if (isClosedWeek) {
+    try {
+      var curParent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+      var curIt = curParent.getFoldersByName(currentWeekWindow_().label);
+      if (curIt.hasNext()) {
+        var curFiles = curIt.next().getFiles();
+        while (curFiles.hasNext()) {
+          var cf = curFiles.next();
+          if (!cf.isTrashed()) currentWeekFileNames[cf.getName()] = true;
+        }
+      }
+    } catch (e) { /* current week folder not readable — fall back to old behavior */ }
+  }
+
+  var parent;
   try {
     parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
-    source = DriveApp.getFolderById(SHARED_DRIVE_FOLDER_ID);
   } catch (e) {
-    report.error = 'Cannot open a required folder: ' + e.toString();
+    report.error = 'Cannot open the archive parent folder: ' + e.toString();
     log_('WeeklyArchive: ' + report.error);
     return report;
   }
@@ -3111,22 +3674,74 @@ function snapshotWeeklyReports(weekStartIso, weekEndIso) {
     existing[ex.getName()] = { file: ex, updated: ex.getLastUpdated().getTime() };
   }
 
-  var files = source.getFiles();
-  while (files.hasNext()) {
+  // Gather candidates from EVERY source folder before copying anything.
+  //
+  // During a fleet migration the two folders are both live: v2.0.7+ agents write
+  // to the newly-configured folder while older agents still write to the folder
+  // compiled into their binary. Scanning only one would silently archive half the
+  // fleet — and the half it missed would read as "never reported". So scan both
+  // and keep the NEWEST instance of each filename, whichever folder it came from.
+  // That also makes the migration self-healing: as each agent updates, its file
+  // simply starts arriving from the other folder and the newest still wins.
+  var sourceIds = archiveSourceFolderIds_();
+  report.sourcesScanned = [];
+  var candidates = {};   // fileName -> { file, updated, sourceId }
+
+  for (var s = 0; s < sourceIds.length; s++) {
+    var sid = sourceIds[s];
+    var srcFolder;
+    try {
+      srcFolder = DriveApp.getFolderById(sid);
+    } catch (e) {
+      report.sourcesScanned.push({ folderId: sid, ok: false, error: e.toString() });
+      log_('WeeklyArchive: cannot open source folder ' + sid + ' — ' + e.toString());
+      continue;
+    }
+    var seenHere = 0;
+    // getFiles() lists only direct children, never subfolders — so when the
+    // upload folder IS the archive parent, the dated folders we create are not
+    // re-scanned and cannot be copied into themselves.
+    var sIt = srcFolder.getFiles();
+    while (sIt.hasNext()) {
+      var sf = sIt.next();
+      if (sf.isTrashed()) continue;
+      var sfn = sf.getName();
+      if (!/_claude_(daily|session)\.json$/i.test(sfn)) continue;
+      seenHere++;
+      var upd = sf.getLastUpdated().getTime();
+      var held = candidates[sfn];
+      if (!held || upd > held.updated) {
+        candidates[sfn] = { file: sf, updated: upd, sourceId: sid };
+      }
+    }
+    report.sourcesScanned.push({
+      folderId: sid, ok: true, folderName: srcFolder.getName(), reportFiles: seenHere
+    });
+  }
+
+  var fileNames = Object.keys(candidates);
+  for (var n = 0; n < fileNames.length; n++) {
     if (Date.now() - started > ARCHIVE_TIME_BUDGET_MS) {
       report.timedOut = true;
-      log_('WeeklyArchive: hit the time budget — the next daily run resumes where this stopped');
+      report.remainingAfterTimeout = fileNames.length - n;
+      log_('WeeklyArchive: hit the time budget with ' + report.remainingAfterTimeout +
+           ' file(s) left — the next daily run resumes where this stopped');
       break;
     }
-    var f = files.next();
-    if (f.isTrashed()) continue;
-    var fn = f.getName();
-    if (!/_claude_(daily|session)\.json$/i.test(fn)) continue;
-
-    var srcUpdated = f.getLastUpdated().getTime();
+    var fn = fileNames[n];
+    var cand = candidates[fn];
+    var f = cand.file;
+    var srcUpdated = cand.updated;
     var prior = existing[fn];
 
     if (prior) {
+      // Fixed 2026-07-30: a newer source file no longer automatically means
+      // "genuine late arrival for THIS week" — it might just be today's ordinary
+      // upload, now that the current week has its own folder to go to instead.
+      // If this person already has a file there, they've moved on; leave their
+      // entry in this CLOSED week exactly as it was rather than overwriting a
+      // real historical record with content that belongs to the new week.
+      if (currentWeekFileNames[fn]) { report.movedToCurrentWeek.push(fn); continue; }
       // Only replace when the live file is genuinely newer — a late reporter.
       if (srcUpdated <= prior.updated + 1000) { report.skipped.push(fn); continue; }
       try {
@@ -3151,11 +3766,15 @@ function snapshotWeeklyReports(weekStartIso, weekEndIso) {
     newlyCopied: report.copied.length,
     refreshedFromLateUploads: report.refreshed.length,
     alreadyCurrent: report.skipped.length,
-    failures: report.failed.length
+    frozenBecauseMovedToCurrentWeek: report.movedToCurrentWeek.length,
+    failures: report.failed.length,
+    distinctReportFiles: fileNames.length
   };
   log_('WeeklyArchive "' + win.label + '": ' + report.summary.newlyCopied + ' copied, ' +
        report.summary.refreshedFromLateUploads + ' refreshed, ' +
-       report.summary.alreadyCurrent + ' unchanged, ' + report.summary.failures + ' failed');
+       report.summary.alreadyCurrent + ' unchanged, ' +
+       report.summary.frozenBecauseMovedToCurrentWeek + ' frozen (moved to current week), ' +
+       report.summary.failures + ' failed');
   return report;
 }
 
@@ -3245,6 +3864,184 @@ function listArchivedWeeks() {
   return { parentFolderId: WEEKLY_ARCHIVE_PARENT_ID, weeks: out, weekCount: out.length };
 }
 
+// ================================================================
+// v5.4 — REPORT SEARCH BY DATE RANGE
+// ================================================================
+// Requirement 3: "Provide a Date Range filter to search reports for a specific
+// period", and removed users' reports stay searchable for their retention window.
+//
+// Implementation note on WHY this does not parse folder names. The archive names
+// its folders "July 20-26 2026" via formatWeekLabel_. Parsing that back into
+// dates is ambiguous and locale-sensitive (and breaks outright on a month
+// boundary, e.g. "June 29-July 5 2026"). Instead this walks the weeks that
+// overlap the requested range and asks formatWeekLabel_ for each label — the
+// exact same function that created the folders. Lookup is then an exact-name
+// match, so it cannot drift from the writer.
+var SEARCH_MAX_WEEKS = 110;          // ~2 years; guards against a runaway range
+var SEARCH_TIME_BUDGET_MS = 4 * 60 * 1000;
+
+// The Monday that starts the week containing the given yyyy-MM-dd date.
+// Anchored at UTC noon like the rest of the week maths here, so a DST or
+// offset boundary cannot shift the result by a day.
+function mondayOfIso_(iso) {
+  var tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+  var p = String(iso).split('-');
+  var d = new Date(Date.UTC(parseInt(p[0], 10), parseInt(p[1], 10) - 1, parseInt(p[2], 10), 12, 0, 0));
+  var dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  var dow = dayMap[Utilities.formatDate(d, tz, 'EEE')];
+  d.setUTCDate(d.getUTCDate() + ((dow === 0) ? -6 : 1 - dow));
+  return Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+}
+
+function isIsoDateOnly_(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim()) &&
+         !isNaN(new Date(String(s).trim() + 'T12:00:00Z').getTime());
+}
+
+// Turn a report filename back into a developer name.
+// "Hitarth_Desai_claude_daily.json" -> { developer: 'Hitarth_Desai', type: 'daily' }
+function parseReportFileName_(fileName) {
+  var m = String(fileName || '').match(/^(.*)_claude_(daily|session)\.json$/i);
+  if (!m) return null;
+  return { developer: m[1], type: m[2].toLowerCase() };
+}
+
+// startIso / endIso: 'yyyy-MM-dd' inclusive. developerFilter: optional substring.
+function searchReportsByDateRange(startIso, endIso, developerFilter) {
+  requireAdmin_();
+  var started = Date.now();
+
+  var start = String(startIso || '').trim();
+  var end   = String(endIso   || '').trim();
+  if (!isIsoDateOnly_(start) || !isIsoDateOnly_(end)) {
+    return { error: 'Both dates must be yyyy-MM-dd (for example 2026-07-01).',
+             received: { startIso: startIso, endIso: endIso } };
+  }
+  if (start > end) { var swap = start; start = end; end = swap; }
+
+  var filter = String(developerFilter || '').trim().toLowerCase();
+  var out = {
+    requested: { startIso: start, endIso: end, developerFilter: filter || null },
+    weeks: [], weeksWithNoArchive: [],
+    summary: {}, truncated: false
+  };
+
+  var parent;
+  try {
+    parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+    out.searchedIn = parent.getName();
+  } catch (e) {
+    return { error: 'Cannot open the reports folder: ' + e.toString(),
+             folderId: WEEKLY_ARCHIVE_PARENT_ID };
+  }
+
+  // Walk every Monday-start week that overlaps the requested range. A range of
+  // a single day still returns the whole week containing it, because that is the
+  // granularity the reports are archived at — stated in the response so the
+  // caller is never misled about what a match means.
+  var cursor = mondayOfIso_(start);
+  var lastMonday = mondayOfIso_(end);
+  var labels = [];
+  var guard = 0;
+  while (cursor <= lastMonday && guard < SEARCH_MAX_WEEKS) {
+    var p = cursor.split('-');
+    var anchor = new Date(Date.UTC(parseInt(p[0], 10), parseInt(p[1], 10) - 1, parseInt(p[2], 10), 12, 0, 0));
+    anchor.setUTCDate(anchor.getUTCDate() + 6);
+    var weekEnd = Utilities.formatDate(anchor, Session.getScriptTimeZone() || 'Asia/Kolkata', 'yyyy-MM-dd');
+    labels.push({ weekStart: cursor, weekEnd: weekEnd, label: formatWeekLabel_(cursor, weekEnd) });
+    anchor.setUTCDate(anchor.getUTCDate() + 1); // -> next Monday
+    cursor = Utilities.formatDate(anchor, Session.getScriptTimeZone() || 'Asia/Kolkata', 'yyyy-MM-dd');
+    guard++;
+  }
+  if (guard >= SEARCH_MAX_WEEKS) {
+    out.truncated = true;
+    out.truncationNote = 'Range covers more than ' + SEARCH_MAX_WEEKS +
+      ' weeks; only the first ' + SEARCH_MAX_WEEKS + ' were searched.';
+  }
+
+  var totalFiles = 0;
+  var developersSeen = {};
+
+  for (var i = 0; i < labels.length; i++) {
+    if (Date.now() - started > SEARCH_TIME_BUDGET_MS) {
+      out.truncated = true;
+      out.truncationNote = 'Stopped after ' + i + ' of ' + labels.length +
+        ' weeks to stay inside the execution limit. Narrow the range.';
+      break;
+    }
+    var wk = labels[i];
+    var it = parent.getFoldersByName(wk.label);
+    if (!it.hasNext()) { out.weeksWithNoArchive.push(wk.label); continue; }
+
+    var folder = it.next();
+    var files = [];
+    var fIt = folder.getFiles();
+    while (fIt.hasNext()) {
+      var f = fIt.next();
+      if (f.isTrashed()) continue;
+      var meta = parseReportFileName_(f.getName());
+      if (!meta) continue;
+      if (filter && meta.developer.toLowerCase().indexOf(filter) === -1) continue;
+      developersSeen[meta.developer] = true;
+      totalFiles++;
+      files.push({
+        developer: meta.developer,
+        type: meta.type,
+        fileName: f.getName(),
+        url: f.getUrl(),
+        sizeBytes: f.getSize(),
+        lastModified: f.getLastUpdated().toISOString()
+      });
+    }
+    files.sort(function(a, b) {
+      if (a.developer !== b.developer) return a.developer.localeCompare(b.developer);
+      return a.type.localeCompare(b.type);
+    });
+    // A week folder that exists but matched nothing under a developer filter is
+    // reported with an empty list rather than omitted, so the caller can tell
+    // "no archive for that week" apart from "that person did not report".
+    out.weeks.push({
+      label: wk.label, weekStart: wk.weekStart, weekEnd: wk.weekEnd,
+      folderUrl: folder.getUrl(), folderId: folder.getId(),
+      developerCount: Object.keys(files.reduce(function(acc, x) { acc[x.developer] = 1; return acc; }, {})).length,
+      fileCount: files.length,
+      files: files
+    });
+  }
+
+  var devList = Object.keys(developersSeen).sort();
+  out.summary = {
+    weeksSearched: labels.length,
+    weeksWithReports: out.weeks.length,
+    weeksMissing: out.weeksWithNoArchive.length,
+    totalFiles: totalFiles,
+    distinctDevelopers: devList.length,
+    developers: devList
+  };
+  out.granularityNote = 'Reports are archived per Mon-Sun week, so results cover every week ' +
+    'that OVERLAPS the requested dates — not a day-by-day slice. Each file itself contains the ' +
+    'developer\'s full usage history, so a specific day can be filtered from the file contents.';
+  if (out.summary.weeksWithReports === 0) {
+    out.verdict = 'No archived reports found in that range. Weekly folders only exist from the date ' +
+      'the archive was first run onward — earlier periods were never captured.';
+  } else {
+    out.verdict = 'Found ' + totalFiles + ' report file(s) for ' + devList.length +
+      ' developer(s) across ' + out.weeks.length + ' week(s).';
+  }
+  return out;
+}
+
+// ---- Editor-runnable wrapper (Run cannot pass arguments) ----
+// Edit these three, then Run logReportSearch.
+var SEARCH_FROM = '2026-07-01';
+var SEARCH_TO   = '2026-07-31';
+var SEARCH_DEVELOPER = '';   // '' = everyone, or e.g. 'Hitarth'
+
+function logReportSearch() {
+  Logger.log(JSON.stringify(
+    searchReportsByDateRange(SEARCH_FROM, SEARCH_TO, SEARCH_DEVELOPER), null, 2));
+}
+
 function logArchiveAccessCheck() {
   Logger.log(JSON.stringify(checkWeeklyArchiveAccess(), null, 2));
 }
@@ -3255,6 +4052,346 @@ function logArchiveSnapshotNow() {
 
 function logArchivedWeeks() {
   Logger.log(JSON.stringify(listArchivedWeeks(), null, 2));
+}
+
+// ================================================================
+// v5.3 — LIVE REPORT MIRROR
+// ================================================================
+// Requirement: the reports must appear in the nominated Drive folder
+// (WEEKLY_ARCHIVE_PARENT_ID), not only in the Shared Drive the agents write to.
+//
+// The agents cannot write there themselves. They authenticate as a service
+// account, and a service account has no Drive storage allocation, so it cannot
+// OWN a file — which is what creating one in an ordinary folder requires. Inside
+// a Shared Drive the drive owns the files, which is why the current setup works.
+// Granting the service account Editor does not change this; ownership and
+// permission are different things.
+//
+// THIS script, however, executes as a real user with real storage. So the server
+// mirrors the files instead. The destination, the filenames and the content are
+// identical to a direct upload; only the writer differs. It also works for every
+// agent on every version — including the dormant machines that will never
+// self-update — which a client-side change could never achieve.
+//
+// Runs hourly. The dated weekly folders are produced separately by
+// snapshotWeeklyReports and are unaffected.
+var MIRROR_TIME_BUDGET_MS = 4 * 60 * 1000;
+
+function syncLatestReportsToReportsFolder() {
+  var started = Date.now();
+  var report = { copied: [], refreshed: [], skipped: [], failed: [], timedOut: false };
+
+  var dest;
+  try {
+    dest = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+    report.destinationFolder = dest.getName();
+  } catch (e) {
+    report.error = 'Cannot open the reports folder: ' + e.toString();
+    log_('ReportMirror: ' + report.error);
+    return report;
+  }
+
+  // Index what is already mirrored at the TOP LEVEL of the destination.
+  // getFiles() never descends into the dated subfolders, so archived copies are
+  // not mistaken for mirrored ones.
+  var existing = {};
+  var exIt = dest.getFiles();
+  while (exIt.hasNext()) {
+    var ex = exIt.next();
+    if (ex.isTrashed()) continue;
+    if (!/_claude_(daily|session)\.json$/i.test(ex.getName())) continue;
+    existing[ex.getName()] = { file: ex, updated: ex.getLastUpdated().getTime() };
+  }
+
+  // Read from wherever the agents actually write. Deliberately reuses the archive's
+  // source list so a future move to a Shared Drive folder needs no change here.
+  var sourceIds = archiveSourceFolderIds_().filter(function(id) {
+    return id !== WEEKLY_ARCHIVE_PARENT_ID; // never mirror the folder onto itself
+  });
+  report.sourcesScanned = [];
+  var candidates = {};
+
+  for (var s = 0; s < sourceIds.length; s++) {
+    var sid = sourceIds[s], srcFolder;
+    try {
+      srcFolder = DriveApp.getFolderById(sid);
+    } catch (e) {
+      report.sourcesScanned.push({ folderId: sid, ok: false, error: e.toString() });
+      continue;
+    }
+    var n = 0;
+    var sIt = srcFolder.getFiles();
+    while (sIt.hasNext()) {
+      var sf = sIt.next();
+      if (sf.isTrashed()) continue;
+      var sfn = sf.getName();
+      if (!/_claude_(daily|session)\.json$/i.test(sfn)) continue;
+      n++;
+      var upd = sf.getLastUpdated().getTime();
+      if (!candidates[sfn] || upd > candidates[sfn].updated) {
+        candidates[sfn] = { file: sf, updated: upd };
+      }
+    }
+    report.sourcesScanned.push({ folderId: sid, ok: true, folderName: srcFolder.getName(), reportFiles: n });
+  }
+
+  var names = Object.keys(candidates);
+  for (var i = 0; i < names.length; i++) {
+    if (Date.now() - started > MIRROR_TIME_BUDGET_MS) {
+      report.timedOut = true;
+      report.remainingAfterTimeout = names.length - i;
+      log_('ReportMirror: time budget reached, ' + report.remainingAfterTimeout +
+           ' file(s) deferred to the next hourly run');
+      break;
+    }
+    var fn = names[i];
+    var cand = candidates[fn];
+    var prior = existing[fn];
+
+    if (prior) {
+      // A mirrored copy's timestamp is its copy time, which is always later than
+      // the source it came from. So "source is newer" reliably means the agent has
+      // uploaded again since the last mirror.
+      if (cand.updated <= prior.updated + 1000) { report.skipped.push(fn); continue; }
+      try {
+        prior.file.setTrashed(true);
+        cand.file.makeCopy(fn, dest);
+        report.refreshed.push(fn);
+      } catch (e) {
+        report.failed.push({ file: fn, error: e.toString() });
+      }
+      continue;
+    }
+    try {
+      cand.file.makeCopy(fn, dest);
+      report.copied.push(fn);
+    } catch (e) {
+      report.failed.push({ file: fn, error: e.toString() });
+    }
+  }
+
+  report.summary = {
+    newlyMirrored: report.copied.length,
+    updated: report.refreshed.length,
+    alreadyCurrent: report.skipped.length,
+    failures: report.failed.length,
+    distinctReportFiles: names.length
+  };
+  log_('ReportMirror -> "' + report.destinationFolder + '": ' + report.summary.newlyMirrored +
+       ' new, ' + report.summary.updated + ' updated, ' + report.summary.alreadyCurrent +
+       ' unchanged, ' + report.summary.failures + ' failed');
+
+  // Fixed 2026-07-30: also keep the CURRENT week's dated folder in sync, using
+  // the SAME candidates already scanned above — no extra Drive listing needed.
+  // Without this, today's uploads had nowhere to land except the previous
+  // (closed) week's folder, which is what made "July 20-26 2026" keep absorbing
+  // this week's activity days after that period actually ended.
+  report.currentWeekFolder = snapshotIntoWeekFolder_(currentWeekWindow_(), candidates, started);
+
+  // v5.5: on-demand pulls ride the same hourly job. They are matched by a
+  // different filename pattern and land in their own folder, so they never mix
+  // with the weekly compliance record.
+  try { report.onDemand = syncOnDemandReports_(); }
+  catch (e) { report.onDemand = { error: e.toString() }; }
+
+  return report;
+}
+
+// Copies the given {fileName: {file, updated}} candidates into the dated
+// folder for `win` ({weekStart, weekEnd, label}), creating it if needed.
+// Shared by the hourly mirror (current week, using its already-scanned
+// candidates) and the daily archive catch-up (completed week, its own scan).
+function snapshotIntoWeekFolder_(win, candidates, startedAt) {
+  var out = { label: win.label, copied: [], refreshed: [], skipped: [], failed: [], timedOut: false };
+  var parent;
+  try {
+    parent = DriveApp.getFolderById(WEEKLY_ARCHIVE_PARENT_ID);
+  } catch (e) {
+    out.error = 'Cannot open the archive parent folder: ' + e.toString();
+    return out;
+  }
+
+  var target;
+  var it = parent.getFoldersByName(win.label);
+  if (it.hasNext()) { target = it.next(); out.folderExisted = true; }
+  else { target = parent.createFolder(win.label); out.folderExisted = false; }
+  out.folderId = target.getId();
+
+  var existing = {};
+  var exIt = target.getFiles();
+  while (exIt.hasNext()) {
+    var ex = exIt.next();
+    if (ex.isTrashed()) continue;
+    existing[ex.getName()] = { file: ex, updated: ex.getLastUpdated().getTime() };
+  }
+  out.existingFileNames = Object.keys(existing);
+
+  var names = Object.keys(candidates);
+  for (var i = 0; i < names.length; i++) {
+    if (Date.now() - startedAt > MIRROR_TIME_BUDGET_MS) {
+      out.timedOut = true;
+      break;
+    }
+    var fn = names[i];
+    var cand = candidates[fn];
+    var prior = existing[fn];
+    if (prior) {
+      if (cand.updated <= prior.updated + 1000) { out.skipped.push(fn); continue; }
+      try {
+        prior.file.setTrashed(true);
+        cand.file.makeCopy(fn, target);
+        out.refreshed.push(fn);
+      } catch (e) {
+        out.failed.push({ file: fn, error: e.toString() });
+      }
+      continue;
+    }
+    try {
+      cand.file.makeCopy(fn, target);
+      out.copied.push(fn);
+    } catch (e) {
+      out.failed.push({ file: fn, error: e.toString() });
+    }
+  }
+
+  log_('CurrentWeekSync -> "' + win.label + '": ' + out.copied.length + ' new, ' +
+       out.refreshed.length + ' updated, ' + out.skipped.length + ' unchanged, ' +
+       out.failed.length + ' failed');
+  return out;
+}
+
+function isLatestSyncTriggerInstalled() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'syncLatestReportsToReportsFolder') return true;
+  }
+  return false;
+}
+
+function ensureLatestSyncTrigger_() {
+  if (isLatestSyncTriggerInstalled()) return false;
+  ScriptApp.newTrigger('syncLatestReportsToReportsFolder').timeBased().everyHours(1).create();
+  log_('ReportMirror: hourly sync trigger installed');
+  return true;
+}
+
+function installLatestSyncTrigger() {
+  requireAdmin_();
+  var created = ensureLatestSyncTrigger_();
+  return { success: true, created: created,
+           message: created ? 'Hourly report mirror installed' : 'Already installed' };
+}
+
+function uninstallLatestSyncTrigger() {
+  requireAdmin_();
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'syncLatestReportsToReportsFolder') {
+      ScriptApp.deleteTrigger(triggers[i]); removed++;
+    }
+  }
+  return { success: true, removed: removed };
+}
+
+// Run this ONCE: installs the hourly trigger and does the first sync immediately
+// so the folder is populated now rather than up to an hour from now.
+function logEnableReportMirror() {
+  requireAdmin_();
+  var out = { triggerCreated: ensureLatestSyncTrigger_() };
+  out.firstRun = syncLatestReportsToReportsFolder();
+  Logger.log(JSON.stringify(out, null, 2));
+}
+
+function logSyncLatestReports() {
+  Logger.log(JSON.stringify(syncLatestReportsToReportsFolder(), null, 2));
+}
+
+// ================================================================
+// DASHBOARD LOAD DIAGNOSTIC + CACHE WARMER
+// ================================================================
+// "INITIALIZING OPERATIONS CENTER..." forever means the page HTML was served
+// (doGet worked) but the follow-up getDashboardData() call never came back.
+// There are only three real causes, and this tells them apart:
+//
+//   1. The build is simply slow — a big ComplianceLog, a large roster, or the
+//      script being busy serving ~77 agents polling every 60 seconds.
+//   2. The payload is too large to CACHE. getDashboardData swallows that failure
+//      and logs 'Cache skip', so every single page load silently repeats the full
+//      uncached build. That turns one slow load into permanently slow loads.
+//   3. It exceeds the 6-minute execution ceiling and is killed, in which case the
+//      browser's success handler never fires and the spinner spins forever.
+//
+// Running this also WARMS the cache, so the very next browser load is served
+// from cache and returns immediately. Use it as the practical unblock.
+function diagnoseDashboardLoad() {
+  requireAdmin_();
+  var out = {};
+
+  var t0 = Date.now();
+  var data = getDashboardData_uncached_();
+  out.buildMs = Date.now() - t0;
+
+  var t1 = Date.now();
+  var json = JSON.stringify(data);
+  out.stringifyMs = Date.now() - t1;
+  out.payloadBytes = json.length;
+  out.payloadKB = Math.round(json.length / 1024);
+  out.cacheChunksNeeded = Math.ceil(json.length / 50000);
+
+  out.counts = {
+    registeredDevelopers: (data.registeredDevelopers || []).length,
+    removedUsers:         (data.removedUsers || []).length,
+    activeUsers:          (data.activeUsers || []).length,
+    weeks:                (data.weeks || []).length,
+    recentUploads:        (data.recentUploads || []).length,
+    triggerQueue:         (data.triggerQueue || []).length,
+    complianceGridRows:   Object.keys(data.complianceGrid || {}).length
+  };
+
+  // Which single section is the heaviest? Usually recentUploads or complianceByWeek.
+  out.sectionBytes = {};
+  ['activeUsers', 'complianceByWeek', 'complianceGrid', 'recentUploads',
+   'registeredDevelopers', 'removedUsers'].forEach(function(k) {
+    try { out.sectionBytes[k] = JSON.stringify(data[k] || null).length; } catch (e) {}
+  });
+
+  // Now actually warm the cache and report honestly whether it stuck.
+  var cache = CacheService.getScriptCache();
+  try {
+    chunkedCachePut(cache, 'dashboardData', json, 300);
+    var readBack = chunkedCacheGet(cache, 'dashboardData');
+    out.cacheWritten = !!readBack;
+    out.cacheReadBackBytes = readBack ? readBack.length : 0;
+    out.cacheIntact = !!readBack && readBack.length === json.length;
+  } catch (e) {
+    out.cacheWritten = false;
+    out.cacheError = e.toString();
+  }
+  cache.put('lastModified', String(Date.now()), 3600);
+
+  if (!out.cacheWritten || !out.cacheIntact) {
+    out.verdict = 'CACHE IS FAILING (payload ' + out.payloadKB + ' KB). Every page load therefore ' +
+      'rebuilds from scratch, which is why it never finishes. This needs the payload reduced — ' +
+      'the heaviest sections are listed in sectionBytes.';
+  } else if (out.buildMs > 120000) {
+    out.verdict = 'VERY SLOW BUILD (' + Math.round(out.buildMs / 1000) + 's). Close to the 6-minute ' +
+      'execution ceiling, past which the browser spinner hangs forever. Cache is now warm, so reload ' +
+      'the dashboard and it should appear at once — but this needs reducing.';
+  } else if (out.buildMs > 30000) {
+    out.verdict = 'SLOW BUILD (' + Math.round(out.buildMs / 1000) + 's) but the cache is warm now. ' +
+      'Reload the dashboard — it should load immediately. Expect another slow load when the 5-minute ' +
+      'cache expires.';
+  } else {
+    out.verdict = 'HEALTHY: built in ' + out.buildMs + 'ms, cached ' + out.payloadKB + ' KB ' +
+      'successfully. If the browser still hangs, the fault is client-side — hard-refresh with ' +
+      'Ctrl+Shift+R, or try an incognito window to rule out stale cached JavaScript.';
+  }
+  return out;
+}
+
+function logDashboardLoad() {
+  Logger.log(JSON.stringify(diagnoseDashboardLoad(), null, 2));
 }
 
 // -------------------- PAUSE / RESUME --------------------
@@ -3457,7 +4594,7 @@ function getUploadSchedule_() {
   if (!isFinite(monthDay) || monthDay < 1 || monthDay > 31) monthDay = 1;
   return {
     frequency: frequency,
-    time: normalizeUploadTime_(getSetting_('globalUploadTime', '13:00')),
+    time: getUploadTimeSetting_('13:00'),
     day: day,
     monthDay: monthDay,
     timeZone: Session.getScriptTimeZone() || 'Asia/Kolkata'
@@ -3486,6 +4623,62 @@ function setSettingValue_(sheet, key, value) {
   sheet.appendRow([key, value]);
 }
 
+// Bug found 2026-07-30: writing '00:00' via setSettingValue_ silently produced a
+// dashboard schedule of 13:00, not 00:00 — the requirement (Monday 00:00 IST)
+// was never actually in effect despite applyWeeklyGenerationDefault_ believing
+// it had set it.
+//
+// Root cause: Sheets auto-detects a plain .setValue('00:00') as a TIME and
+// stores the cell as a Date (epoch 1899-12-30 + that time-of-day), not the
+// literal string. getSetting_ then does String(dateCell), which yields
+// something like "Sat Dec 30 1899 00:00:00 GMT+0530" — a string that matches
+// neither of normalizeUploadTime_'s parse branches (HH:mm, or a 0-1 day
+// fraction), so it silently fell through to the hardcoded '13:00' default.
+// No error was ever thrown; the value just quietly wasn't what was written.
+//
+// Fix, at both ends:
+//  - WRITE: force the cell to plain-text format before setValue, so Sheets can
+//    never reinterpret "00:00" as a time type again.
+//  - READ: if a cell written by the OLD code path is still Date-typed, recover
+//    the real time via Utilities.formatDate instead of String(), and repair the
+//    cell back to text so this self-heals without needing a manual sheet edit.
+function setTimeSettingValue_(sheet, key, hhmm) {
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === key) {
+      var cell = sheet.getRange(i + 1, 2);
+      cell.setNumberFormat('@STRING@').setValue(hhmm);
+      return;
+    }
+  }
+  var row = sheet.getLastRow() + 1;
+  sheet.appendRow([key, hhmm]);
+  sheet.getRange(row, 2).setNumberFormat('@STRING@').setValue(hhmm);
+}
+
+function getUploadTimeSetting_(defaultVal) {
+  var sheet = ensureSettingsSheet_();
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() !== 'globalUploadTime') continue;
+    var raw = data[i][1];
+    if (raw && typeof raw.getTime === 'function') {
+      // A stale Date-typed cell from before this fix. Use Utilities.formatDate
+      // with the script timezone — the same pattern every other date/time read
+      // in this file uses (getCurrentWeekStart_, formatWeekLabel_, etc.) — rather
+      // than raw Date getters, whose local-vs-UTC behavior inside the Apps
+      // Script V8 runtime is not worth relying on here.
+      var tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+      var fixed = Utilities.formatDate(raw, tz, 'HH:mm');
+      setTimeSettingValue_(sheet, 'globalUploadTime', fixed); // self-heal
+      log_('Settings: repaired globalUploadTime from a Date-typed cell to "' + fixed + '"');
+      return fixed;
+    }
+    return normalizeUploadTime_(String(raw).trim());
+  }
+  return normalizeUploadTime_(defaultVal);
+}
+
 function setUploadSchedule(schedule) {
   requireAdmin_();
   schedule = schedule || {};
@@ -3500,7 +4693,7 @@ function setUploadSchedule(schedule) {
 
   var sheet = ensureSettingsSheet_();
   setSettingValue_(sheet, 'uploadFrequency', frequency);
-  setSettingValue_(sheet, 'globalUploadTime', time);
+  setTimeSettingValue_(sheet, 'globalUploadTime', time);
   setSettingValue_(sheet, 'globalUploadDay', day);
   setSettingValue_(sheet, 'globalUploadMonthDay', monthDay);
   invalidateCache_();
@@ -3537,19 +4730,24 @@ function forceSendUpdateTrigger(name) {
 
 // v2: bulk-force-update — used by the Version Drift card to upgrade every
 // developer whose reported version is behind the latest manifest.
+//
+// Fixed 2026-07-30: this used to call adminQueueTrigger() once per name in a
+// loop, so a 26-person batch acquired and released the whole-script lock 26
+// separate times. With ~20 agents heartbeating concurrently (each briefly
+// taking the same lock for its own smart-retry/auto-generate check), that
+// reliably produced "Lock timeout" partway through — the admin would watch a
+// batch of "Force Hot-Patch" clicks succeed for a while then start failing as
+// contention built up. adminQueueTriggerBatch takes the lock ONCE for the
+// entire list, so a 26-person batch is exactly as lock-safe as a 1-person one.
 function forceSendUpdateBatch(names) {
   requireAdmin_();
   if (!Array.isArray(names) || names.length === 0) return { success: false, error: 'No names provided' };
-  var ok = 0, fail = 0, errors = [];
-  names.forEach(function(n) {
-    try {
-      var r = adminQueueTrigger(n, 'UPDATE');
-      if (r && r.success) ok++; else { fail++; errors.push(n + ': ' + (r && r.error || 'unknown')); }
-    } catch (e) {
-      fail++; errors.push(n + ': ' + e.toString());
-    }
-  });
-  return { success: fail === 0, queued: ok, failed: fail, errors: errors };
+  var result = adminQueueTriggerBatch(names, 'UPDATE');
+  // Preserve the response shape the Version Matrix "Force update N outdated"
+  // button already expects (success/queued/failed/errors), rather than the
+  // queued/skipped shape adminQueueTriggerBatch returns for its other caller.
+  var errors = result.skipped.map(function(n) { return n + ': already queued'; });
+  return { success: errors.length === 0, queued: result.queued.length, failed: errors.length, errors: errors };
 }
 
 // ================================================================
@@ -3769,6 +4967,138 @@ function renderEmailTemplate_(text, user) {
   return out;
 }
 
+// ---------- HTML EMAIL RENDERING (v5.5) ----------
+// Why this exists: the templates are plain text with hard newlines every ~75
+// characters. Mail clients honour those literally, so a sentence written across
+// two source lines arrived visibly broken in the middle, with ragged gaps.
+//
+// This reflows the text: a BLANK line still starts a new paragraph (author
+// intent), but a single newline inside a paragraph is treated as a soft wrap and
+// joined back into flowing text. Numbered steps, bullets and the bare URL keep
+// their own lines, because there the break IS meaningful.
+function htmlEsc_(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildEmailHtml_(subject, plainBody) {
+  var BRAND = '#0047FB';
+  var text = String(plainBody == null ? '' : plainBody).replace(/\r\n/g, '\n');
+
+  // Split on blank lines — those are the author's real paragraph breaks.
+  var blocks = text.split(/\n[ \t]*\n/);
+  var html = '';
+
+  blocks.forEach(function(block) {
+    var lines = block.split('\n').map(function(l) { return l.replace(/\s+$/, ''); })
+                     .filter(function(l) { return l.trim() !== ''; });
+    if (lines.length === 0) return;
+
+    // A block whose lines are numbered steps or bullets keeps one item per line.
+    var isList = lines.every(function(l) { return /^\s*(\d+\.|[-*•])\s+/.test(l); }) ||
+                 lines.filter(function(l) { return /^\s*(\d+\.|[-*•])\s+/.test(l); }).length >= 2;
+
+    if (isList) {
+      // Lead-in lines BEFORE the first marker ("Steps:", "Two things to be
+      // aware of:") carry real meaning and must not be swallowed. Without this
+      // they hit the `else if (items.length)` branch with an empty list and
+      // were dropped from the delivered mail entirely.
+      var leadIn = [];
+      var listLines = [];
+      var seenMarker = false;
+      lines.forEach(function(l) {
+        if (/^\s*(\d+\.|[-*•])\s+/.test(l)) seenMarker = true;
+        (seenMarker ? listLines : leadIn).push(l);
+      });
+      if (leadIn.length) {
+        html += '<p style="margin:0 0 10px;line-height:1.7;color:#0f172a;font-weight:700">' +
+                inlineEmailMarkup_(leadIn.join(' ')) + '</p>';
+      }
+
+      var ordered = /^\s*\d+\./.test(listLines[0]);
+      // Continuation lines (indented, no marker) belong to the previous item —
+      // append them rather than emitting a stray bullet.
+      var items = [];
+      listLines.forEach(function(l) {
+        if (/^\s*(\d+\.|[-*•])\s+/.test(l)) {
+          items.push(l.replace(/^\s*(\d+\.|[-*•])\s+/, '').trim());
+        } else if (items.length) {
+          items[items.length - 1] += ' ' + l.trim();
+        }
+      });
+      html += '<' + (ordered ? 'ol' : 'ul') +
+              ' style="margin:0 0 16px;padding-left:22px;color:#334155">' +
+        items.map(function(it) {
+          return '<li style="margin:0 0 7px;line-height:1.65">' + inlineEmailMarkup_(it) + '</li>';
+        }).join('') +
+      '</' + (ordered ? 'ol' : 'ul') + '>';
+      return;
+    }
+
+    // A lone URL on its own — render as a prominent button instead of raw text.
+    if (lines.length === 1 && /^https?:\/\/\S+$/.test(lines[0].trim())) {
+      var href = lines[0].trim();
+      html += '<p style="margin:0 0 20px"><a href="' + htmlEsc_(href) + '"' +
+              ' style="display:inline-block;background:' + BRAND + ';color:#ffffff;' +
+              'text-decoration:none;font-weight:700;padding:12px 22px;border-radius:8px;' +
+              'font-size:15px">Download the Claude Usage Uploader</a></p>';
+      return;
+    }
+
+    // Ordinary paragraph: join the soft-wrapped lines back into flowing text.
+    html += '<p style="margin:0 0 15px;line-height:1.7;color:#334155">' +
+            inlineEmailMarkup_(lines.join(' ')) + '</p>';
+  });
+
+  return '' +
+  '<div style="margin:0;padding:0;background:#f1f5f9">' +
+    '<div style="max-width:640px;margin:0 auto;padding:26px 18px">' +
+      '<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">' +
+        '<div style="background:linear-gradient(135deg,#0047FB,#0087BD);padding:20px 26px">' +
+          '<div style="color:#ffffff;font:700 17px/1.3 Arial,Helvetica,sans-serif">Sigma Solve</div>' +
+          '<div style="color:rgba(255,255,255,.85);font:400 12px/1.4 Arial,Helvetica,sans-serif;' +
+          'margin-top:3px">Claude Code Usage Reporting</div>' +
+        '</div>' +
+        '<div style="padding:26px;font:400 15px/1.7 Arial,Helvetica,sans-serif;color:#334155">' +
+          html +
+        '</div>' +
+      '</div>' +
+      '<div style="text-align:center;color:#94a3b8;font:400 11px/1.6 Arial,Helvetica,sans-serif;' +
+      'padding:14px 8px">This is an automated message from the Sigma Solve Compliance Dashboard.</div>' +
+    '</div>' +
+  '</div>';
+}
+
+// Bolds the things a recipient must not miss, and linkifies bare URLs.
+// Deliberately conservative: it only emphasises known key phrases and literal
+// filenames/paths, so it can never mangle arbitrary admin-authored wording.
+function inlineEmailMarkup_(line) {
+  var s = htmlEsc_(line);
+
+  // Bare URLs -> real links (skip ones already inside a button block).
+  s = s.replace(/(https?:\/\/[^\s<]+)/g, function(u) {
+    return '<a href="' + u + '" style="color:#0047FB;font-weight:600">' + u + '</a>';
+  });
+
+  // Literal things the user has to type, click, or find on disk.
+  s = s.replace(/(Repair-Claude-Uploader\.cmd|install guide\.txt|service-account-key\.json|%TEMP%\\claude-uploader\.log|%TEMP%)/g,
+    '<code style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;' +
+    'padding:1px 5px;font:600 13px/1.5 Consolas,Monaco,monospace;color:#0f172a">$1</code>');
+
+  // Key instruction phrases -> bold.
+  [
+    'Run as administrator', 'Extract All', 'RIGHT-CLICK', 'Right-click',
+    'your own Windows login', 'Action required',
+    'There is no icon and no window', 'runs silently in the background'
+  ].forEach(function(phrase) {
+    var esc = htmlEsc_(phrase).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    s = s.replace(new RegExp('(' + esc + ')', 'g'), '<strong style="color:#0f172a">$1</strong>');
+  });
+
+  return s;
+}
+
 // Single send path for every user-facing email, so quota failures, missing
 // addresses and missing download URLs are reported the same way everywhere.
 function sendUserEmail_(kind, user, overrideSubject, overrideBody) {
@@ -3791,7 +5121,16 @@ function sendUserEmail_(kind, user, overrideSubject, overrideBody) {
   }
 
   try {
-    GmailApp.sendEmail(user.email, subject, body);
+    // v5.5: send as formatted HTML with the plain text kept as the fallback
+    // body. The templates are authored as plain text with hard '\n' line breaks
+    // at fixed column positions, which is what made the delivered mail wrap
+    // mid-sentence and look broken. buildEmailHtml_ reflows those into real
+    // paragraphs so sentences stay intact at any window width, and promotes the
+    // key instructions to bold.
+    GmailApp.sendEmail(user.email, subject, body, {
+      htmlBody: buildEmailHtml_(subject, body),
+      name: 'Sigma Solve Engineering'
+    });
     return { sent: true };
   } catch (e) {
     return { sent: false, error: e.toString() };
@@ -3976,6 +5315,27 @@ function lastCompletedWeekWindow_() {
   var anchor = new Date(Date.UTC(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10), 12, 0, 0));
   anchor.setUTCDate(anchor.getUTCDate() - 7);
   var start = Utilities.formatDate(anchor, tz, 'yyyy-MM-dd');
+  anchor.setUTCDate(anchor.getUTCDate() + 6);
+  var end = Utilities.formatDate(anchor, tz, 'yyyy-MM-dd');
+  return { weekStart: start, weekEnd: end, label: formatWeekLabel_(start, end) };
+}
+
+// The Monday-to-Sunday window IN PROGRESS right now.
+//
+// Bug found 2026-07-30: without this, the only dated folder that exists during
+// an in-progress week is the PREVIOUS (closed) one, still being refreshed for
+// late arrivals. Every ordinary upload during the current week — not just
+// genuine stragglers — was newer than what that old folder held, so the daily
+// archive job kept sweeping today's activity into last week's folder simply
+// because there was nowhere else for it to go. "July 20-26 2026" is supposed to
+// mean reports observed for that period, not "whatever's newest as of today."
+// Creating and maintaining the CURRENT week's folder from day one gives new
+// activity somewhere correct to land, closing that gap.
+function currentWeekWindow_() {
+  var tz = Session.getScriptTimeZone() || 'Asia/Kolkata';
+  var start = getCurrentWeekStart_();                    // yyyy-MM-dd, script tz
+  var parts = start.split('-');
+  var anchor = new Date(Date.UTC(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10), 12, 0, 0));
   anchor.setUTCDate(anchor.getUTCDate() + 6);
   var end = Utilities.formatDate(anchor, tz, 'yyyy-MM-dd');
   return { weekStart: start, weekEnd: end, label: formatWeekLabel_(start, end) };
@@ -4231,15 +5591,23 @@ var SETUP_LATEST_VERSION = '2.0.7';
 // empty URL makes sendUserEmail_ refuse to send, which is the right outcome —
 // far better than mailing a Mac user a Windows executable. Build the matching
 // bundles and fill these in if non-Windows machines ever join the fleet.
+// ⚠ SHARING MUST BE RESTRICTED. This ZIP contains service-account-key.json, a
+// live credential. On 2026-07-28 both the v2.0.6 and v2.0.7 bundles were found
+// set to "Anyone with the link" — the full archive, key included, downloaded
+// with no Google account at all. Whenever you replace this file, re-check
+// Share on the Drive file itself: uploading a new version does NOT inherit the
+// previous file's (or the parent folder's) restriction.
 var SETUP_DOWNLOAD_URLS = {
-  windows: 'https://drive.google.com/file/d/1u9x8TwE8j2oW5wK3hPSmxrUCM57K3wbP/view?usp=sharing',
+  windows: 'https://drive.google.com/file/d/1pzTuzaJ8ptJNDzgxpUjDbGx-mE_jGkZM/view?usp=sharing',
   macos:   '',
   linux:   ''
 };
 
-// Who receives the Monday 12:00 IST digest. REPLACE THESE PLACEHOLDERS — they
-// are intentionally invalid so a typo can never silently mail the wrong person.
-var SETUP_DIGEST_RECIPIENTS = 'REPLACE_dhairya@sigmasolve.com, REPLACE_tejas@sigmasolve.com';
+// Who receives the Monday 12:00 IST digest. Set to tpansuriya@sigmasolve.com
+// only for now (2026-07-30) — add the rest of the requirement's recipients
+// (Dhairya) once confirmed; this is a deliberate interim scope, not the final
+// list.
+var SETUP_DIGEST_RECIPIENTS = 'tpansuriya@sigmasolve.com';
 
 // Who may use the admin actions. Leave '' to stay in pilot mode (any visitor
 // with the link can act — fine for a pilot, not for production).
@@ -4335,7 +5703,7 @@ function applyWeeklyGenerationDefault_() {
   var sheet = ensureSettingsSheet_();
   setSettingValue_(sheet, 'uploadFrequency', 'weekly');
   setSettingValue_(sheet, 'globalUploadDay', 'Monday');
-  setSettingValue_(sheet, 'globalUploadTime', '00:00');
+  setTimeSettingValue_(sheet, 'globalUploadTime', '00:00');
   props.setProperty('weeklyScheduleAligned', '1');
   invalidateCache_();
   log_('v5 init: fleet generation schedule pinned to weekly / Monday / 00:00 ' +

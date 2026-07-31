@@ -27,6 +27,7 @@ const pageTitles = {
   compliance: 'Compliance',
   developers: 'Registered Users',
   versions: 'Version Matrix',
+  reports: 'Report Search',
   queue: 'Queue & Runs',
   health: 'System Health'
 };
@@ -55,6 +56,10 @@ function renderPageData(page) {
     loadDownloadUrls();
   }
   if (page === 'versions')    renderVersionMatrix();
+  // v5.4: the report search reads Drive, not the cached dashboard payload, so it
+  // is never fetched automatically — only when the admin actually asks. First
+  // visit just seeds sensible dates.
+  if (page === 'reports')     initReportSearch();
   if (page === 'health')      renderHealthKpis();
   if (page === 'queue') {
     renderQueuePage();
@@ -67,6 +72,391 @@ function renderPageData(page) {
   } else {
     clearInterval(queuePageInterval); queuePageInterval = null;
   }
+}
+
+/* ============================================================
+   v5.4 — REPORT SEARCH (Requirement 3)
+   ============================================================
+   Searches the archived weekly report folders in Drive by date range.
+   Deliberately NOT part of the auto-refresh cycle: it walks Drive folders,
+   which is far too slow to run every 30 seconds, and an admin only wants it
+   when they actually ask. Results link into Drive rather than attempting to
+   render the JSON here — the files are full usage histories and can be large. */
+
+var rsSearching = false;
+var rsSeeded = false;
+
+function rsEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function rsIso(d) {
+  var m = d.getMonth() + 1, day = d.getDate();
+  return d.getFullYear() + '-' + (m < 10 ? '0' + m : m) + '-' + (day < 10 ? '0' + day : day);
+}
+
+// Monday of the week containing d. getDay() is 0 for Sunday, which must map back
+// to the PREVIOUS Monday, not forward six days.
+function rsMondayOf(d) {
+  var x = new Date(d.getTime());
+  var dow = x.getDay();
+  x.setDate(x.getDate() + (dow === 0 ? -6 : 1 - dow));
+  return x;
+}
+
+function rsBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function initReportSearch() {
+  // The developer list is refreshed on every visit (cheap — it reads the
+  // already-loaded dashboard payload, no server call), so newly-registered
+  // people appear without a page reload. The date seeding stays one-shot so
+  // it never clobbers dates the admin has already set.
+  populateReportDeveloperOptions();
+  populateOnDemandDeveloperOptions();
+  if (rsSeeded) return;
+  rsSeeded = true;
+  setReportRange('thisMonth');
+  loadOnDemandReports();
+}
+
+/* ============================================================
+   v5.5 — ON-DEMAND (BACKDATED) REPORT PULL
+   ============================================================ */
+
+// Only agents that can actually respond are offered. A paused/removed agent
+// ignores triggers entirely, and an offline one will not pick the request up
+// until it returns — so both are labelled rather than silently failing later.
+function populateOnDemandDeveloperOptions() {
+  var sel = document.getElementById('odDeveloper');
+  if (!sel) return;
+  var previous = sel.value;
+
+  var users = (dashboardData.activeUsers || []).filter(function(u) {
+    return u.status !== 'Removed';
+  }).slice().sort(function(a, b) { return a.name.localeCompare(b.name); });
+
+  sel.innerHTML = '<option value="">Select a developer…</option>' +
+    users.map(function(u) {
+      var online = isOnline(u);
+      var tag = u.paused ? ' — paused (cannot respond)' : (online ? ' — online' : ' — offline');
+      return '<option value="' + rsEsc(u.name) + '"' + (u.paused ? ' disabled' : '') + '>' +
+             rsEsc(u.name.replace(/_/g, ' ')) + tag + '</option>';
+    }).join('');
+
+  if (previous) sel.value = previous;
+}
+
+function requestDatedReport() {
+  var sel  = document.getElementById('odDeveloper');
+  var from = document.getElementById('odFrom');
+  var to   = document.getElementById('odTo');
+  var btn  = document.getElementById('odGenerateBtn');
+  var msg  = document.getElementById('odMsg');
+
+  var name = sel ? sel.value : '';
+  if (!name) { showToast('Pick a developer first', true); return; }
+  if (!from.value || !to.value) { showToast('Pick both dates', true); return; }
+  if (from.value > to.value)    { showToast('The From date is after the To date', true); return; }
+
+  var origText = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '&#8987; Queuing…';
+  if (msg) msg.textContent = '';
+
+  google.script.run
+    .withSuccessHandler(function(res) {
+      btn.disabled = false;
+      btn.innerHTML = origText;
+      if (!res || !res.success) {
+        var err = (res && res.error) ? res.error : 'unknown error';
+        showToast('Could not queue: ' + err, true);
+        if (msg) msg.innerHTML = '<span style="color:var(--red)">' + rsEsc(err) + '</span>';
+        return;
+      }
+      showToast('Requested — their machine will upload it shortly');
+      if (msg) msg.innerHTML = '<span style="color:var(--green)">' + rsEsc(res.note || '') + '</span>';
+      // Poll the list a couple of times so the finished file appears on its own
+      // rather than making the admin guess when to hit Refresh.
+      setTimeout(loadOnDemandReports, 45000);
+      setTimeout(loadOnDemandReports, 120000);
+    })
+    .withFailureHandler(function(err) {
+      btn.disabled = false;
+      btn.innerHTML = origText;
+      var m = String((err && err.message) || err);
+      showToast('Failed: ' + m, true);
+      if (msg) msg.innerHTML = '<span style="color:var(--red)">' + rsEsc(m) + '</span>';
+    })
+    .adminQueueDatedReport(name, from.value, to.value);
+}
+
+function loadOnDemandReports() {
+  var box = document.getElementById('onDemandList');
+  if (!box) return;
+  box.innerHTML = '<div class="empty-state">Checking for finished reports…</div>';
+  google.script.run
+    .withSuccessHandler(renderOnDemandReports)
+    .withFailureHandler(function(err) {
+      box.innerHTML = '<div class="empty-state" style="color:var(--red)">Could not load: ' +
+                      rsEsc(String((err && err.message) || err)) + '</div>';
+    })
+    .listOnDemandReports();
+}
+
+function renderOnDemandReports(res) {
+  var box = document.getElementById('onDemandList');
+  if (!box) return;
+
+  if (!res || res.error) {
+    box.innerHTML = '<div class="empty-state" style="color:var(--red)">' +
+                    rsEsc((res && res.error) || 'No response') + '</div>';
+    return;
+  }
+  var list = res.reports || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="empty-state">No on-demand reports yet. ' +
+      'Request one above — it appears here once that machine uploads it.</div>';
+    return;
+  }
+
+  // Group the daily/session pair per person+period into a single row, since
+  // they are always produced together and an admin thinks of them as one report.
+  var groups = {};
+  list.forEach(function(r) {
+    var key = r.developer + '|' + r.since + '|' + r.until;
+    if (!groups[key]) {
+      groups[key] = { developer: r.developer, since: r.since, until: r.until,
+                      generatedIso: r.generatedIso, files: [], allEmpty: true };
+    }
+    groups[key].files.push(r);
+    if (!r.looksEmpty) groups[key].allEmpty = false;
+    if (r.generatedIso > groups[key].generatedIso) groups[key].generatedIso = r.generatedIso;
+  });
+
+  var rows = Object.keys(groups).map(function(k) { return groups[k]; })
+    .sort(function(a, b) { return b.generatedIso.localeCompare(a.generatedIso); });
+
+  var html = '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+    '<th>Developer</th><th>Period</th><th>Generated</th><th>Result</th><th>Download</th>' +
+    '</tr></thead><tbody>';
+
+  rows.forEach(function(g) {
+    var period = (g.since === g.until) ? g.since : (g.since + ' to ' + g.until);
+    var when = String(g.generatedIso).replace('T', ' ').substring(0, 16);
+    // An all-empty pair is a real, meaningful outcome — that person had no
+    // Claude activity in the window. Say so instead of implying failure.
+    var verdict = g.allEmpty
+      ? '<span class="badge b-amber">No usage in this period</span>'
+      : '<span class="badge b-green">Has data</span>';
+    var links = g.files.sort(function(a, b) { return a.type.localeCompare(b.type); })
+      .map(function(f) {
+        return '<a class="btn btn-ghost btn-sm" href="' + rsEsc(f.downloadUrl) +
+               '" target="_blank" rel="noopener" style="margin-right:6px">&#11015; ' +
+               rsEsc(f.type) + ' (' + rsBytes(f.sizeBytes) + ')</a>';
+      }).join('');
+
+    html += '<tr>' +
+      '<td><strong>' + rsEsc(g.developer.replace(/_/g, ' ')) + '</strong></td>' +
+      '<td>' + rsEsc(period) + '</td>' +
+      '<td>' + rsEsc(when) + '</td>' +
+      '<td>' + verdict + '</td>' +
+      '<td>' + links + '</td>' +
+    '</tr>';
+  });
+
+  html += '</tbody></table></div>';
+  box.innerHTML = html;
+}
+
+// v5.5: developer picker instead of free-text. Sourced from the roster the
+// dashboard payload already carries, so it cannot drift from the real names —
+// and it removes the class of "no results" caused purely by a typo or a
+// space-vs-underscore mismatch in a hand-typed name.
+function populateReportDeveloperOptions() {
+  var sel = document.getElementById('rsDeveloper');
+  if (!sel) return;
+  var previous = sel.value;
+
+  var names = {};
+  (dashboardData.registeredDevelopers || []).forEach(function(r) { if (r.name) names[r.name] = true; });
+  // Include removed users too — their reports stay searchable for the full
+  // retention window, so excluding them here would hide findable data.
+  (dashboardData.removedUsers || []).forEach(function(r) { if (r.name) names[r.name] = true; });
+  var list = Object.keys(names).sort(function(a, b) { return a.localeCompare(b); });
+
+  sel.innerHTML = '<option value="">All developers</option>' +
+    list.map(function(n) {
+      return '<option value="' + rsEsc(n) + '">' + rsEsc(n.replace(/_/g, ' ')) + '</option>';
+    }).join('');
+
+  // Preserve an in-progress selection across the refresh.
+  if (previous && list.indexOf(previous) !== -1) sel.value = previous;
+}
+
+function setReportRange(preset) {
+  var today = new Date();
+  var from, to;
+
+  if (preset === 'thisWeek') {
+    from = rsMondayOf(today);
+    to = new Date(from.getTime()); to.setDate(to.getDate() + 6);
+  } else if (preset === 'lastWeek') {
+    from = rsMondayOf(today); from.setDate(from.getDate() - 7);
+    to = new Date(from.getTime()); to.setDate(to.getDate() + 6);
+  } else if (preset === 'thisMonth') {
+    from = new Date(today.getFullYear(), today.getMonth(), 1);
+    to = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+  } else if (preset === 'lastMonth') {
+    from = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+    to = new Date(today.getFullYear(), today.getMonth(), 0);
+  } else if (preset === 'last90') {
+    to = today;
+    from = new Date(today.getTime()); from.setDate(from.getDate() - 89);
+  } else { // 'all' — capped at 2 years, which is just under the server's week limit
+    to = today;
+    from = new Date(today.getTime()); from.setDate(from.getDate() - 728);
+  }
+
+  document.getElementById('rsFrom').value = rsIso(from);
+  document.getElementById('rsTo').value = rsIso(to);
+}
+
+function runReportSearch() {
+  if (rsSearching) return;
+  var from = document.getElementById('rsFrom').value;
+  var to   = document.getElementById('rsTo').value;
+  var dev  = document.getElementById('rsDeveloper').value.trim();
+
+  if (!from || !to) { showToast('Pick both a From and a To date.', true); return; }
+  if (from > to)    { showToast('The From date is after the To date.', true); return; }
+
+  rsSearching = true;
+  document.getElementById('reportSearchSummary').innerHTML = '';
+  document.getElementById('reportSearchResults').innerHTML =
+    '<div class="card"><div class="empty-state">Searching Drive for ' +
+    rsEsc(from) + ' to ' + rsEsc(to) + '&hellip;<br>' +
+    '<span style="opacity:.7">Wide ranges take longer — each week is a separate Drive folder.</span>' +
+    '</div></div>';
+
+  google.script.run
+    .withSuccessHandler(function(res) { rsSearching = false; renderReportSearch(res); })
+    .withFailureHandler(function(e) {
+      rsSearching = false;
+      document.getElementById('reportSearchResults').innerHTML =
+        '<div class="card"><div class="empty-state">Search failed: ' +
+        rsEsc(e && e.message ? e.message : e) + '</div></div>';
+    })
+    .searchReportsByDateRange(from, to, dev);
+}
+
+function renderReportSearch(res) {
+  var sumEl = document.getElementById('reportSearchSummary');
+  var resEl = document.getElementById('reportSearchResults');
+
+  if (!res) {
+    sumEl.innerHTML = '';
+    resEl.innerHTML = '<div class="card"><div class="empty-state">No response from the server.</div></div>';
+    return;
+  }
+  if (res.error) {
+    sumEl.innerHTML = '';
+    resEl.innerHTML = '<div class="card"><div class="empty-state">' + rsEsc(res.error) + '</div></div>';
+    return;
+  }
+
+  var s = res.summary || {};
+  sumEl.innerHTML =
+    '<div class="kpi-strip" style="margin-bottom:1.5rem;">' +
+      '<div class="kpi-card"><div class="kpi-val sv-green">' + (s.weeksWithReports || 0) +
+        '</div><div class="kpi-label">Weeks with reports</div></div>' +
+      '<div class="kpi-card"><div class="kpi-val">' + (s.totalFiles || 0) +
+        '</div><div class="kpi-label">Report files</div></div>' +
+      '<div class="kpi-card"><div class="kpi-val">' + (s.distinctDevelopers || 0) +
+        '</div><div class="kpi-label">Developers</div></div>' +
+      '<div class="kpi-card"><div class="kpi-val ' + ((s.weeksMissing || 0) ? 'sv-amber' : 'sv-green') + '">' +
+        (s.weeksMissing || 0) + '</div><div class="kpi-label">Weeks not archived</div></div>' +
+    '</div>';
+
+  var html = '';
+
+  if (res.truncated && res.truncationNote) {
+    html += '<div class="card" style="margin-bottom:1.5rem;"><div class="section-sub" style="color:var(--amber)">' +
+            rsEsc(res.truncationNote) + '</div></div>';
+  }
+
+  if (!res.weeks || res.weeks.length === 0) {
+    html += '<div class="card"><div class="empty-state">' +
+            rsEsc(res.verdict || 'No archived reports in that range.') + '</div></div>';
+    resEl.innerHTML = html;
+    return;
+  }
+
+  // Newest week first — that is what an admin almost always wants to see.
+  var weeks = res.weeks.slice().sort(function(a, b) {
+    return String(b.weekStart).localeCompare(String(a.weekStart));
+  });
+
+  weeks.forEach(function(w) {
+    html +=
+      '<div class="card" style="margin-bottom:1.5rem;">' +
+        '<div class="section-hd">' +
+          '<div>' +
+            '<div class="section-title">' + rsEsc(w.label) + '</div>' +
+            '<div class="section-sub">' + rsEsc(w.weekStart) + ' to ' + rsEsc(w.weekEnd) +
+              ' &middot; ' + (w.developerCount || 0) + ' developer(s) &middot; ' +
+              (w.fileCount || 0) + ' file(s)</div>' +
+          '</div>' +
+          '<a class="btn btn-ghost btn-sm" href="' + rsEsc(w.folderUrl) +
+            '" target="_blank" rel="noopener">&#128193; Open in Drive</a>' +
+        '</div>';
+
+    if (!w.files || w.files.length === 0) {
+      // The folder exists but matched nothing — say so, rather than showing an
+      // empty table that reads like a bug.
+      html += '<div class="empty-state">No files matched the developer filter for this week.</div></div>';
+      return;
+    }
+
+    html +=
+      '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+        '<th>Developer</th><th>Type</th><th>Size</th><th>Last updated</th><th></th>' +
+      '</tr></thead><tbody>';
+
+    w.files.forEach(function(f) {
+      var when = f.lastModified ? String(f.lastModified).replace('T', ' ').substring(0, 16) : '';
+      html +=
+        '<tr>' +
+          '<td><strong>' + rsEsc(String(f.developer).replace(/_/g, ' ')) + '</strong></td>' +
+          '<td>' + rsEsc(f.type) + '</td>' +
+          '<td>' + rsBytes(f.sizeBytes) + '</td>' +
+          '<td>' + rsEsc(when) + '</td>' +
+          '<td><a class="btn btn-ghost btn-sm" href="' + rsEsc(f.url) +
+            '" target="_blank" rel="noopener">Open</a></td>' +
+        '</tr>';
+    });
+
+    html += '</tbody></table></div></div>';
+  });
+
+  if (res.weeksWithNoArchive && res.weeksWithNoArchive.length > 0) {
+    html +=
+      '<div class="card"><div class="section-hd"><div>' +
+        '<div class="section-title">Weeks with no archive (' + res.weeksWithNoArchive.length + ')</div>' +
+        '<div class="section-sub">No folder exists for these weeks. Either nothing was uploaded, ' +
+          'or the period predates the weekly archive being switched on.</div>' +
+      '</div></div><div style="padding:0 1.25rem 1.25rem;opacity:.75">' +
+        rsEsc(res.weeksWithNoArchive.join('  ·  ')) +
+      '</div></div>';
+  }
+
+  resEl.innerHTML = html;
 }
 
 function isPaused() {
@@ -1061,8 +1451,28 @@ function submitAddUser() {
     return;
   }
 
+  const payload = {
+    name:         name,
+    email:        email,
+    system:       sysEl ? sysEl.value : '',
+    sendEmail:    sendEmail,
+    emailSubject: (sendEmail && subjEl) ? (subjEl.value || '').trim() : '',
+    emailBody:    (sendEmail && bodyEl) ? (bodyEl.value || '').trim() : ''
+  };
+
+  // Fixed 2026-07-30: adminAddUser takes the same whole-script lock as every
+  // other admin action (adminQueueTrigger, force-updates, etc.), so on a busy
+  // fleet it can lose the 10-second race exactly like Force Hot-Patch did —
+  // "Failed: Exception: Lock timeout..." with nothing wrong with the specific
+  // name or email being added. One retry, same pattern used there, since the
+  // lock is acquired BEFORE anything is written, so a timeout here means
+  // nothing was created and retrying is always safe.
+  submitAddUserAttempt(payload, btn, msg, nameEl, emailEl, subjEl, bodyEl, sendEl, false);
+}
+
+function submitAddUserAttempt(payload, btn, msg, nameEl, emailEl, subjEl, bodyEl, sendEl, isRetry) {
   btn.disabled = true;
-  btn.textContent = 'Adding…';
+  btn.textContent = isRetry ? 'Retrying…' : 'Adding…';
   if (msg) msg.textContent = '';
 
   google.script.run
@@ -1084,9 +1494,9 @@ function submitAddUser() {
       if (bodyEl) bodyEl.value = '';
       if (sendEl) { sendEl.checked = false; toggleAddUserEmailFields(); }
 
-      if (sendEmail && res.emailSent) {
+      if (payload.sendEmail && res.emailSent) {
         showToast('User added and setup email sent');
-      } else if (sendEmail && !res.emailSent) {
+      } else if (payload.sendEmail && !res.emailSent) {
         // Registration succeeded but the mail did not — say so explicitly
         // rather than reporting a blanket success.
         showToast('User added, but the email failed: ' + (res.emailError || 'unknown'), true);
@@ -1097,18 +1507,19 @@ function submitAddUser() {
       fetchData();
     })
     .withFailureHandler(function(err) {
+      var errMsg = String((err && err.message) || '');
+      if (!isRetry && /lock timeout/i.test(errMsg)) {
+        showToast('Fleet is busy — retrying once...', false);
+        setTimeout(function() {
+          submitAddUserAttempt(payload, btn, msg, nameEl, emailEl, subjEl, bodyEl, sendEl, true);
+        }, 2000);
+        return;
+      }
       btn.disabled = false;
       btn.textContent = '+ Add User';
-      showToast('Failed: ' + err.message, true);
+      showToast('Failed: ' + errMsg + (isRetry ? ' (after 1 retry)' : ''), true);
     })
-    .adminAddUser({
-      name:         name,
-      email:        email,
-      system:       sysEl ? sysEl.value : '',
-      sendEmail:    sendEmail,
-      emailSubject: (sendEmail && subjEl) ? (subjEl.value || '').trim() : '',
-      emailBody:    (sendEmail && bodyEl) ? (bodyEl.value || '').trim() : ''
-    });
+    .adminAddUser(payload);
 }
 
 // Backward-compatible alias for dashboard HTML cached from earlier deployments.
@@ -2362,7 +2773,7 @@ function renderVersionMatrix() {
   }).join('');
 }
 
-function forceHotPatch(btn, name) {
+function forceHotPatch(btn, name, isRetry) {
   // Safe argument shifting for old/new signatures
   if (name === undefined) {
     name = btn;
@@ -2375,24 +2786,47 @@ function forceHotPatch(btn, name) {
     }
   }
 
-  if (!confirm('Force an immediate hot-patch update for ' + name + '?')) return;
-  
+  if (!isRetry && !confirm('Force an immediate hot-patch update for ' + name + '?')) return;
+
   const origText = btn ? btn.innerHTML : '';
   if (btn) {
-    btn.innerHTML = '&#8987; Queuing...';
+    btn.innerHTML = isRetry ? '&#8987; Retrying...' : '&#8987; Queuing...';
     btn.disabled = true;
   }
-  
+
   google.script.run
     .withSuccessHandler(function(res) {
-      showToast('Hot-patch queued for ' + name);
-      if (btn) {
-        btn.innerHTML = '&#10003; Queued';
+      // Bug fixed 2026-07-30: adminQueueTrigger rejects when ANY trigger (of
+      // any type) is already queued for this name, but this handler used to
+      // show "queued" unconditionally — so a rejection (e.g. a FORCE_RUN
+      // already pending) looked identical to success. Read res.success.
+      if (res && res.success) {
+        showToast('Hot-patch queued for ' + name);
+        if (btn) btn.innerHTML = '&#10003; Queued';
+      } else {
+        showToast('Could not queue hot-patch for ' + name + ': ' +
+          (res && res.error ? res.error : 'unknown error') +
+          '. Check Queue & Runs for an existing pending trigger.', true);
+        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
       }
       setTimeout(function() { fetchData(); }, 1500);
     })
     .withFailureHandler(function(err) {
-      showToast('Failed to queue hot-patch: ' + err.message, true);
+      // The whole-script lock (LockService.getScriptLock()) is shared by every
+      // heartbeat's smart-retry/auto-generate check AND every admin action. With
+      // ~20+ agents polling and several cards clicked in quick succession, a
+      // 10-second wait can lose that race — a "Lock timeout" exception. Because
+      // adminQueueTrigger calls lock.waitLock() BEFORE its try block, this throws
+      // before appendRow ever runs: nothing was queued, so a single silent retry
+      // is safe rather than making the admin manually reclick every failed card.
+      var msg = String((err && err.message) || '');
+      if (!isRetry && /lock timeout/i.test(msg)) {
+        showToast('Lock busy for ' + name + ' — retrying once...', false);
+        setTimeout(function() { forceHotPatch(btn, name, true); }, 2000);
+        return;
+      }
+      showToast('Failed to queue hot-patch for ' + name + ': ' + msg +
+        (isRetry ? ' (after 1 retry — fleet is busy, try again shortly)' : ''), true);
       if (btn) {
         btn.innerHTML = origText;
         btn.disabled = false;
@@ -2402,30 +2836,24 @@ function forceHotPatch(btn, name) {
 }
 
 // Theme Switcher Logic
+//
+// Fixed 2026-07-30: this used to persist the choice to localStorage and
+// silently restore it on every future load, before first paint. That meant
+// whichever theme someone last clicked \u2014 even during one-off testing \u2014
+// became a standing per-browser override of the Sigma Solve brand default.
+// The dashboard should always open on the branded blue/cyan theme; switching
+// during a session still works, it just no longer survives a refresh.
 function changeTheme(theme) {
   if (theme === 'default') {
     document.body.removeAttribute('data-theme');
   } else {
     document.body.setAttribute('data-theme', theme);
   }
-  localStorage.setItem('dashboard-theme', theme);
   // Update active state on pill buttons
   document.querySelectorAll('.theme-pill').forEach(function(btn) {
     btn.classList.toggle('active', btn.getAttribute('data-theme') === theme);
   });
 }
-
-// Auto-restore saved theme before first paint
-(function() {
-  var saved = localStorage.getItem('dashboard-theme') || 'default';
-  if (saved !== 'default') document.body.setAttribute('data-theme', saved);
-  // Pill active state is set after DOM ready in window.onload \u2192 re-apply
-  window.addEventListener('DOMContentLoaded', function() {
-    document.querySelectorAll('.theme-pill').forEach(function(btn) {
-      btn.classList.toggle('active', btn.getAttribute('data-theme') === saved);
-    });
-  });
-})();
 
 window.onload = fetchData;
 
@@ -2448,7 +2876,7 @@ function showToastV2(msg, variant) {
     document.body.appendChild(container);
   }
   var colors = {
-    info:    { bg: 'rgba(37,99,235,0.18)',  bd: 'rgba(37,99,235,0.4)',  fg: '#60a5fa' },
+    info:    { bg: 'rgba(0,71,251,0.18)',  bd: 'rgba(0,71,251,0.4)',  fg: '#00AEEF' },
     success: { bg: 'rgba(16,185,129,0.18)', bd: 'rgba(16,185,129,0.4)', fg: '#34d399' },
     warn:    { bg: 'rgba(245,158,11,0.18)', bd: 'rgba(245,158,11,0.4)', fg: '#fbbf24' },
     error:   { bg: 'rgba(239,68,68,0.18)',  bd: 'rgba(239,68,68,0.4)',  fg: '#f87171' }

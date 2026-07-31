@@ -38,7 +38,7 @@ const IS_LINUX = process.platform === 'linux';
 const PLATFORM_KEY = IS_WIN ? 'win32' : IS_MAC ? 'darwin' : 'linux';
 
 // -------------------- CONFIGURATION --------------------
-const VERSION = '2.0.7';
+const VERSION = '2.0.8';
 const FORCE_RUN = process.argv.includes('--force');
 const IS_SCHEDULED = process.argv.includes('--scheduled');
 const UPDATED_FROM = (() => {
@@ -827,9 +827,16 @@ function checkForAdminTrigger(name) {
         res.on('end', () => {
           try {
             const result = JSON.parse(data);
+            // NOTE: this is a WHITELIST — every server field the poll loop needs
+            // must be named here explicitly. v2.0.7 added driveFolderId on the
+            // server and read trigger.driveFolderId in the caller, but forgot to
+            // add it here, so it was silently dropped and the server-controlled
+            // upload folder never took effect on any agent. Add new fields here
+            // AND at the call site, or they vanish with no error.
             const extra = {
               paused: result.paused || false,
               uploadFrequency: result.uploadFrequency || 'weekly',
+              driveFolderId: result.driveFolderId || '',
               uploadSchedule: result.uploadSchedule || {
                 frequency: result.uploadFrequency || 'weekly',
                 time: '13:00',
@@ -1534,38 +1541,80 @@ function ensureCCUsage() {
 }
 
 // -------------------- REPORT --------------------
-async function generateReports() {
-  const sessionFile = path.join(os.tmpdir(), 'session.json');
-  const dailyFile   = path.join(os.tmpdir(), 'daily.json');
+
+// Builds the ccusage invocation for whichever discovery strategy found the tool.
+function ccusageCmd_(args, envOpts) {
+  if (globalCcusageBinPath) return `"${globalCcusageBinPath}" ${args}`;
+  if (globalCcusageJsPath)  return `${getNodeCmd()} "${globalCcusageJsPath}" ${args}`;
+  return `ccusage ${args}`;
+}
+
+// v2.0.8: run one ccusage report, preferring the explicit `claude` subcommand.
+//
+// WHY: newer ccusage builds cover many agent CLIs (Codex, Copilot, Gemini, ...)
+// and their BARE `daily`/`session` commands no longer reliably surface Claude
+// Code data. Verified 2026-07-31 on a machine with 4 months of local logs:
+//   ccusage daily --json         -> {"daily":[]}        (empty!)
+//   ccusage claude daily --json  -> full 4-month history
+// Reports were silently becoming empty rather than failing loudly. `claude` is
+// asked for first, and the bare form is kept as a fallback so an OLDER ccusage
+// that predates subcommands still works — the fallback triggers only on a
+// non-zero exit, never on a legitimately empty result.
+async function runCcusageReport_(kind, outFile, envOpts, since, until) {
+  const dateFlags = (since && until) ? ` --since ${since} --until ${until}` : '';
+  const variants = [`claude ${kind}`, `${kind}`];
+  let lastErr = null;
+  for (let i = 0; i < variants.length; i++) {
+    try {
+      await runCcusage(ccusageCmd_(`${variants[i]} --json${dateFlags}`, envOpts), outFile, envOpts);
+      if (i > 0) log(`ccusage: '${variants[0]}' unavailable, used '${variants[i]}' instead`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      log(`ccusage: '${variants[i]}' failed (${e.message}) — trying next form`);
+    }
+  }
+  throw lastErr;
+}
+
+// `since`/`until` (yyyy-MM-dd) scope the report to one period. Omit both for the
+// full cumulative history, which is what the normal weekly run wants.
+async function generateReports(since, until) {
+  const scoped = !!(since && until);
+  const suffix = scoped ? `-${since}_to_${until}` : '';
+  const sessionFile = path.join(os.tmpdir(), `session${suffix}.json`);
+  const dailyFile   = path.join(os.tmpdir(), `daily${suffix}.json`);
 
   const envOpts = globalNodeDir
     ? { env: { ...process.env, PATH: `${globalNodeDir}${path.delimiter}${process.env.PATH}` } }
     : {};
 
-  if (globalCcusageBinPath) {
-    await runCcusage(`"${globalCcusageBinPath}" session --json`, sessionFile, envOpts);
-    await runCcusage(`"${globalCcusageBinPath}" daily --json`,   dailyFile,   envOpts);
-  } else if (globalCcusageJsPath) {
-    await runCcusage(`${getNodeCmd()} "${globalCcusageJsPath}" session --json`, sessionFile, envOpts);
-    await runCcusage(`${getNodeCmd()} "${globalCcusageJsPath}" daily --json`,   dailyFile,   envOpts);
-  } else {
-    await runCcusage('ccusage session --json', sessionFile, envOpts);
-    await runCcusage('ccusage daily --json',   dailyFile,   envOpts);
-  }
+  if (scoped) log(`Generating date-scoped report: ${since} to ${until}`);
+  await runCcusageReport_('session', sessionFile, envOpts, since, until);
+  await runCcusageReport_('daily',   dailyFile,   envOpts, since, until);
 
   if (fs.statSync(sessionFile).size === 0 || fs.statSync(dailyFile).size === 0) {
     throw new Error(`${ERR.CCUSAGE_EMPTY_OUTPUT}: Report generation produced empty files`);
   }
 
+  let dailyParsed;
   try {
     JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
-    JSON.parse(fs.readFileSync(dailyFile,   'utf8'));
+    dailyParsed = JSON.parse(fs.readFileSync(dailyFile, 'utf8'));
   } catch {
     throw new Error(`${ERR.CCUSAGE_INVALID_JSON}: Report files contain invalid JSON`);
   }
 
-  log('Reports generated and validated');
-  return { sessionFile, dailyFile };
+  // A valid-but-empty result is NOT an error for a dated pull — it legitimately
+  // means "this person did not use Claude in that window". Report it as a
+  // distinct, honest outcome instead of a failure or a silent success.
+  const rowCount = (dailyParsed && Array.isArray(dailyParsed.daily)) ? dailyParsed.daily.length : 0;
+  if (scoped && rowCount === 0) {
+    log(`Date-scoped report for ${since}..${until} contains NO usage rows (no activity in that period)`);
+  }
+
+  log(`Reports generated and validated${scoped ? ` (${rowCount} day row(s))` : ''}`);
+  return { sessionFile, dailyFile, rowCount, scoped };
 }
 
 // -------------------- DRIVE AUTH (raw JWT, no googleapis) --------------------
@@ -1697,7 +1746,14 @@ async function upload(name, sessionFile, dailyFile) {
         // otherwise fail every attempt forever, silently. Detect that specific
         // class of failure and drop back to the compiled default so the remaining
         // retries land somewhere real — reporting degrades, it does not stop.
-        if (/notFound|File not found|insufficientFilePermissions|insufficientPermissions|403|404/i.test(e.message)) {
+        // storageQuotaExceeded belongs in this list even though it reads like a
+        // disk-full error. A service account has NO Drive storage of its own, so
+        // it cannot own files — it can only create them inside a Shared Drive,
+        // where the drive owns them. Point it at an ordinary My Drive folder and
+        // every create fails with storageQuotaExceeded, permissions
+        // notwithstanding. Without this the fleet would stop reporting entirely
+        // rather than degrading to the folder that does work.
+        if (/notFound|File not found|insufficientFilePermissions|insufficientPermissions|storageQuotaExceeded|quotaExceeded|403|404/i.test(e.message)) {
           if (revertDriveFolderToDefault(`upload to ${activeDriveFolderId} failed: ${e.message.slice(0, 120)}`)) {
             continue; // retry immediately against the default folder
           }
@@ -1734,6 +1790,94 @@ async function upload(name, sessionFile, dailyFile) {
   }
 
   return { sessionFileId, dailyFileId };
+}
+
+// v2.0.8: upload an on-demand dated report.
+//
+// The filename MUST NOT end in _claude_daily.json / _claude_session.json — the
+// server's weekly archive and hourly mirror both match on exactly that suffix,
+// so reusing it would sweep a one-off ad-hoc pull into the Mon–Sun compliance
+// folders and corrupt the audit record. The _ondemand_<since>_to_<until> infix
+// keeps the two streams separate and lets the dashboard parse the covered
+// period straight back out of the name.
+async function uploadDatedReport(name, sessionFile, dailyFile, since, until) {
+  const token = await getDriveAccessToken();
+  const base = sanitize(String(name).replace(/\s+/g, '_'));
+  const stamp = `_ondemand_${since}_to_${until}`;
+  const sessionName = `${base}_claude_session${stamp}.json`;
+  const dailyName   = `${base}_claude_daily${stamp}.json`;
+
+  async function put(filePath, fileName) {
+    const q = encodeURIComponent(
+      `name='${fileName}' and '${getDriveFolderId()}' in parents and trashed=false`);
+    const listRes = await nodeFetch(
+      `https://www.googleapis.com/drive/v3/files?q=${q}&corpora=allDrives` +
+      `&includeItemsFromAllDrives=true&supportsAllDrives=true&fields=files(id)`,
+      { headers: { Authorization: `Bearer ${token}` } });
+    const listData = await listRes.json();
+    const existingId = (listData.files && listData.files[0]) ? listData.files[0].id : null;
+
+    const boundary = '-------314159265358979323846';
+    const meta = { name: fileName };
+    if (!existingId) meta.parents = [getDriveFolderId()];
+    const body = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+                  JSON.stringify(meta) +
+                  `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n`),
+      fs.readFileSync(filePath),
+      Buffer.from(`\r\n--${boundary}--`)
+    ]);
+    const url = existingId
+      ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart&supportsAllDrives=true&fields=id`
+      : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id`;
+    const res = await nodeFetch(url, {
+      method: existingId ? 'PATCH' : 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': `multipart/related; boundary="${boundary}"`,
+        'Content-Length': body.length
+      },
+      body
+    });
+    if (!res.ok) throw new Error(`${ERR.DRIVE_UPLOAD_FAILED}: ${res.status} ${await res.text()}`);
+    const data = await res.json();
+    log(`Uploaded on-demand ${fileName} -> ${data.id}`);
+    return data.id;
+  }
+
+  const sessionId = await put(sessionFile, sessionName);
+  const dailyId   = await put(dailyFile,   dailyName);
+  return { sessionId, dailyId, sessionName, dailyName };
+}
+
+// Full on-demand pipeline: generate for the window, upload, report the outcome.
+//
+// NOTE: this does NOT touch `isRunning`. That flag is function-scoped inside
+// serviceLoop, so a top-level function assigning it would have created a
+// separate global and silently disabled the concurrency guard rather than
+// honouring it. The poll loop already sets isRunning=true around the whole
+// trigger dispatch (and clears it in its own finally), so this is already
+// protected by the caller — the same way FORCE_RUN is.
+async function runDatedReport(cfg, since, until) {
+  await sendPing(cfg.name, 'GENERATE_START', `On-demand ${since} to ${until}`, pingExtra());
+  const { sessionFile, dailyFile, rowCount } = await generateReports(since, until);
+  await sendPing(cfg.name, 'GENERATE_DONE',
+    `On-demand generated (${rowCount} day row(s))`, pingExtra());
+
+  await validateDrive();
+  await uploadDatedReport(cfg.name, sessionFile, dailyFile, since, until);
+
+  // Distinguish "worked, and there was data" from "worked, but that period is
+  // genuinely empty" — otherwise an admin cannot tell a no-usage week from a
+  // broken pull.
+  const msg = rowCount > 0
+    ? `On-demand report ready for ${since}..${until} (${rowCount} day row(s))`
+    : `On-demand report ready for ${since}..${until} — NO usage recorded in that period`;
+  await sendPing(cfg.name, 'SUCCESS', msg, pingExtra());
+  log(msg);
+
+  try { fs.unlinkSync(sessionFile); } catch {}
+  try { fs.unlinkSync(dailyFile); } catch {}
 }
 
 // -------------------- WAIT FOR USER --------------------
@@ -2000,6 +2144,20 @@ async function serviceLoop(cfg) {
         const freshCfg = loadConfig() || cfg;
         await runGenerateAndUpload(freshCfg, 'admin', currentUploadSchedule);
         cfg = loadConfig() || cfg;
+      } else if (trigger.type === 'DATED_RUN') {
+        // v2.0.8: on-demand backdated report for one specific period. Uploaded
+        // under a DIFFERENT filename so the server keeps it out of the weekly
+        // compliance folders entirely.
+        await sendPing(cfg.name, 'POLLING_ACK',
+          `On-demand report requested (${trigger.since} to ${trigger.until})`,
+          pingExtra({ nextPollAt }));
+        try {
+          await runDatedReport(loadConfig() || cfg, trigger.since, trigger.until);
+        } catch (e) {
+          log(`On-demand report failed: ${e.message}`);
+          await sendPing(cfg.name, 'FAILURE',
+            `On-demand ${trigger.since}..${trigger.until} failed: ${e.message}`, pingExtra());
+        }
       } else if (trigger.type === 'UPDATE') {
         await sendPing(cfg.name, 'UPDATE_START', 'Checking for hot-patch update...', pingExtra({ nextPollAt }));
         log('Update trigger received. Checking for updates...');
