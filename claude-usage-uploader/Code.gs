@@ -200,6 +200,7 @@ function doGet(e) {
   // API route: local uploader polls this to check for admin-queued triggers
   if (e && e.parameter && e.parameter.action === 'checkTrigger') {
     var name = e.parameter.name || '';
+    countIngest_('poll');
     var result = checkAndClearTrigger(name);
     return ContentService
       .createTextOutput(JSON.stringify(result))
@@ -794,27 +795,48 @@ function ensureOnDemandFolder_() {
 // Copy any on-demand files the agents have uploaded into the On-Demand Reports
 // folder. Runs from the same hourly job as the live mirror, and is also called
 // directly by the dashboard so a fresh pull appears without waiting an hour.
+// Performance note (fixed 2026-07-31): this originally enumerated EVERY file in
+// the source folder and called getName() on each to spot on-demand ones. With
+// 100+ report files that is 100+ Drive round-trips per call — and because the
+// dashboard called it on page load, it was heavy enough to contribute to Apps
+// Script's "too many scripts running simultaneously" ceiling for something that
+// usually finds nothing at all.
+//
+// searchFiles pushes the filtering to Drive's server side, so an empty result
+// costs one query instead of a hundred calls.
 function syncOnDemandReports_() {
-  var out = { copied: [], skipped: [], failed: [] };
+  var out = { copied: [], skipped: [], failed: [], scanned: 0 };
   var dest;
   try { dest = ensureOnDemandFolder_(); }
   catch (e) { out.error = 'Cannot open the On-Demand folder: ' + e.toString(); return out; }
 
+  // Only the on-demand names, resolved server-side.
+  var SEARCH = 'title contains "_ondemand_"';
+
   var existing = {};
-  var exIt = dest.getFiles();
-  while (exIt.hasNext()) {
-    var ex = exIt.next();
-    if (!ex.isTrashed()) existing[ex.getName()] = ex.getLastUpdated().getTime();
+  try {
+    var exIt = dest.searchFiles(SEARCH);
+    while (exIt.hasNext()) {
+      var ex = exIt.next();
+      if (!ex.isTrashed()) existing[ex.getName()] = ex.getLastUpdated().getTime();
+    }
+  } catch (e) {
+    out.error = 'Could not list existing on-demand files: ' + e.toString();
+    return out;
   }
 
   archiveSourceFolderIds_().forEach(function(sid) {
     var src;
     try { src = DriveApp.getFolderById(sid); } catch (e) { return; }
-    var it = src.getFiles();
+    var it;
+    try { it = src.searchFiles(SEARCH); } catch (e) { return; }
     while (it.hasNext()) {
       var f = it.next();
       if (f.isTrashed()) continue;
       var fn = f.getName();
+      out.scanned++;
+      // Still validate against the full pattern — `contains` is a coarse filter
+      // and must not be trusted to imply the exact naming contract.
       if (!ONDEMAND_FILE_RE.test(fn)) continue;
       var upd = f.getLastUpdated().getTime();
       if (existing[fn] && upd <= existing[fn] + 1000) { out.skipped.push(fn); continue; }
@@ -841,12 +863,21 @@ function listOnDemandReports() {
   requireAdmin_();
   // Pull anything new across before listing, so a report that finished seconds
   // ago is visible immediately rather than on the next hourly tick.
-  var synced = syncOnDemandReports_();
+  //
+  // The sync is best-effort on purpose. It is a convenience, not the source of
+  // truth — if Drive is busy or the account is at its concurrent-execution
+  // ceiling, the already-mirrored reports must still render rather than the
+  // whole page failing with a red box.
+  var synced = { copied: [] };
+  var syncError = '';
+  try { synced = syncOnDemandReports_(); }
+  catch (e) { syncError = e.toString(); }
+  if (synced && synced.error) syncError = synced.error;
 
   var out = [];
   try {
     var folder = ensureOnDemandFolder_();
-    var it = folder.getFiles();
+    var it = folder.searchFiles('title contains "_ondemand_"');
     while (it.hasNext()) {
       var f = it.next();
       if (f.isTrashed()) continue;
@@ -872,13 +903,58 @@ function listOnDemandReports() {
     return { error: e.toString(), reports: [] };
   }
   out.sort(function(a, b) { return b.generatedIso.localeCompare(a.generatedIso); });
-  return { reports: out, count: out.length, justSynced: synced.copied.length };
+  return {
+    reports: out,
+    count: out.length,
+    justSynced: (synced && synced.copied) ? synced.copied.length : 0,
+    // Surfaced as a soft warning above the list, not as a load failure.
+    syncWarning: syncError || undefined
+  };
 }
 
 function logQueueDatedReportExample() {
   // Edit the three values then Run, if you prefer the editor over the dashboard.
   Logger.log(JSON.stringify(
     adminQueueDatedReport('Hitarth_Desai', '2026-06-08', '2026-06-08'), null, 2));
+}
+
+// The on-demand list now relies on Drive-side search instead of enumerating the
+// folder. DriveApp search has historically been less predictable inside Shared
+// Drives, so this proves it works here rather than assuming: it compares a
+// search for a pattern KNOWN to exist against a plain enumeration of the same
+// folder. If searchMatches is 0 while enumerationMatches is not, the search is
+// not honoured on this drive and syncOnDemandReports_ must go back to scanning.
+function logVerifyDriveSearch() {
+  var out = { folders: [] };
+  archiveSourceFolderIds_().forEach(function(sid) {
+    var row = { folderId: sid };
+    try {
+      var src = DriveApp.getFolderById(sid);
+      row.folderName = src.getName();
+
+      var s = 0, it = src.searchFiles('title contains "_claude_daily"');
+      while (it.hasNext()) { it.next(); s++; }
+      row.searchMatches = s;
+
+      var e = 0, total = 0, it2 = src.getFiles();
+      while (it2.hasNext()) {
+        total++;
+        if (it2.next().getName().indexOf('_claude_daily') !== -1) e++;
+      }
+      row.enumerationMatches = e;
+      row.totalFilesInFolder = total;
+      row.searchWorks = (s === e);
+      row.callsSaved = total - s;
+
+      var od = 0, it3 = src.searchFiles('title contains "_ondemand_"');
+      while (it3.hasNext()) { it3.next(); od++; }
+      row.onDemandFilesPresent = od;
+    } catch (err) {
+      row.error = err.toString();
+    }
+    out.folders.push(row);
+  });
+  Logger.log(JSON.stringify(out, null, 2));
 }
 
 function logOnDemandReports() {
@@ -1581,27 +1657,42 @@ function bumpLastModified_() {
 
 var CACHE_TTL_SETTINGS     = 600;  // settings change rarely — 10 min
 var CACHE_TTL_PAUSED       = 120;  // paused state — 2 min
-var CACHE_TTL_TRIGGERQUEUE = 15;   // trigger queue — 15 seconds (must stay fresh)
+// Trigger queue. Freshness comes from invalidateCache_(), which every queueing
+// path calls the moment a trigger is written — NOT from this TTL. The TTL is a
+// safety net for the rare case where invalidation fails, so it does not need to
+// be aggressive. It used to be 15s, which was shorter than the 60s agent poll
+// interval and therefore guaranteed a cache miss on *every* poll from *every*
+// agent — 22 spreadsheet reads a minute for data that had not changed.
+var CACHE_TTL_TRIGGERQUEUE = 60;
+
+// ---------------------------------------------------------------------------
+// Lock policy for the three getters below (changed 2026-07-31)
+//
+// These used to take the shared script lock before populating their cache, to
+// stop several executions computing the same value at once. That was a bad
+// trade. Populating a cache is IDEMPOTENT — if two executions both read the
+// sheet and both write the same value, the result is identical and no data is
+// harmed. The only thing the lock bought was avoiding a duplicate read.
+//
+// What it cost was severe: every agent poll passes through here, so 22 agents
+// churned the one global script lock continuously. Genuine mutations that
+// legitimately need exclusivity — deleting a user, claiming a trigger — then
+// could not get it, and surfaced to the admin as
+// "Lock timeout: another process was holding the lock for too long".
+//
+// So: no lock on read/populate paths. The lock is now reserved for actual
+// mutations. A redundant sheet read is cheap; a starved mutation is not.
+// ---------------------------------------------------------------------------
 
 function getSettingCached_(key, defaultVal) {
   var c = CacheService.getScriptCache();
   var cacheKey = 'setting_' + key;
   var cached = c.get(cacheKey);
   if (cached !== null) return cached;
-  
-  var lock = LockService.getScriptLock();
-  if (lock.tryLock(5000)) {
-    try {
-      cached = c.get(cacheKey);
-      if (cached !== null) return cached;
-      var val = getSetting_(key, defaultVal);
-      c.put(cacheKey, String(val), CACHE_TTL_SETTINGS);
-      return val;
-    } finally {
-      lock.releaseLock();
-    }
-  }
-  return defaultVal;
+
+  var val = getSetting_(key, defaultVal);
+  try { c.put(cacheKey, String(val), CACHE_TTL_SETTINGS); } catch (e) {}
+  return val;
 }
 
 // Returns a plain set {lowerCaseName: true} for O(1) lookup.
@@ -1611,23 +1702,12 @@ function getPausedSetCached_() {
   if (cached !== null) {
     try { return JSON.parse(cached); } catch(e) {}
   }
-  var lock = LockService.getScriptLock();
-  if (lock.tryLock(5000)) {
-    try {
-      cached = c.get('pausedSet');
-      if (cached !== null) {
-        try { return JSON.parse(cached); } catch(e) {}
-      }
-      var map = getPausedDevelopersMap_();
-      var set = {};
-      Object.keys(map).forEach(function(k) { set[k] = true; });
-      try { c.put('pausedSet', JSON.stringify(set), CACHE_TTL_PAUSED); } catch(e) {}
-      return set;
-    } finally {
-      lock.releaseLock();
-    }
-  }
-  return {};
+
+  var map = getPausedDevelopersMap_();
+  var set = {};
+  Object.keys(map).forEach(function(k) { set[k] = true; });
+  try { c.put('pausedSet', JSON.stringify(set), CACHE_TTL_PAUSED); } catch(e) {}
+  return set;
 }
 
 // Returns serialised trigger-queue rows so doGet/checkAndClearTrigger
@@ -1638,35 +1718,24 @@ function getTriggerQueueRowsCached_() {
   if (cached !== null) {
     try { return JSON.parse(cached); } catch(e) {}
   }
-  var lock = LockService.getScriptLock();
-  if (lock.tryLock(5000)) {
-    try {
-      cached = c.get('triggerQueueRows');
-      if (cached !== null) {
-        try { return JSON.parse(cached); } catch(e) {}
-      }
-      var ss = SpreadsheetApp.getActiveSpreadsheet();
-      var sheet = ss.getSheetByName('TriggerQueue');
-      if (!sheet) {
-        try { c.put('triggerQueueRows', '[]', CACHE_TTL_TRIGGERQUEUE); } catch(e) {}
-        return [];
-      }
-      var data = sheet.getDataRange().getValues();
-      var rows = [];
-      for (var i = 1; i < data.length; i++) {
-        if (data[i][0]) rows.push({
-          name:      String(data[i][0]).trim(),
-          type:      data[i][3] ? String(data[i][3]).trim() : 'FORCE_RUN',
-          notBefore: data[i][4] ? String(data[i][4]).trim() : ''
-        });
-      }
-      try { c.put('triggerQueueRows', JSON.stringify(rows), CACHE_TTL_TRIGGERQUEUE); } catch(e) {}
-      return rows;
-    } finally {
-      lock.releaseLock();
-    }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('TriggerQueue');
+  if (!sheet) {
+    try { c.put('triggerQueueRows', '[]', CACHE_TTL_TRIGGERQUEUE); } catch(e) {}
+    return [];
   }
-  return [];
+  var data = sheet.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0]) rows.push({
+      name:      String(data[i][0]).trim(),
+      type:      data[i][3] ? String(data[i][3]).trim() : 'FORCE_RUN',
+      notBefore: data[i][4] ? String(data[i][4]).trim() : ''
+    });
+  }
+  try { c.put('triggerQueueRows', JSON.stringify(rows), CACHE_TTL_TRIGGERQUEUE); } catch(e) {}
+  return rows;
 }
 
 // Lightweight endpoint — returns only a change timestamp.
@@ -1726,21 +1795,30 @@ function getDashboardData() {
     try { return JSON.parse(cached); } catch(e) {}
   }
   
+  // The lock here is a de-duplication nicety, not a correctness requirement:
+  // getDashboardData_uncached_ is strictly read-only (verified — no setValue /
+  // appendRow / setProperty anywhere in it), so two executions computing it
+  // concurrently produce the same answer and harm nothing.
+  //
+  // It used to waitLock(10000) and THROW on timeout. That made a busy moment
+  // look like a server fault to the admin, and — worse — it held the one global
+  // script lock for the entire payload computation, starving real mutations like
+  // Delete User, which then failed with "Lock timeout: another process was
+  // holding the lock for too long".
+  //
+  // Now: try briefly to be the single computer, but never fail and never block
+  // a mutation for long. If the lock is busy, just compute anyway.
   var lock = LockService.getScriptLock();
   var locked = false;
+  try { locked = lock.tryLock(4000); } catch (e) { locked = false; }
+
   try {
-    lock.waitLock(10000);
-    locked = true;
-  } catch (e) {
-    throw new Error("Server is generating dashboard data. Please retry in a few moments.");
-  }
-  
-  try {
+    // Whoever held the lock may have just finished populating the cache.
     cached = chunkedCacheGet(cache, 'dashboardData');
     if (cached) {
       try { return JSON.parse(cached); } catch(e) {}
     }
-    
+
     var data = getDashboardData_uncached_();
     try {
       chunkedCachePut(cache, 'dashboardData', JSON.stringify(data), 300); // 5 mins
@@ -1749,7 +1827,9 @@ function getDashboardData() {
     }
     return data;
   } finally {
-    if (locked) lock.releaseLock();
+    if (locked) {
+      try { lock.releaseLock(); } catch (e) {}
+    }
   }
 }
 
@@ -2301,30 +2381,20 @@ function maybeQueueDailyAutoGenerate_(name) {
     }
   }
 
-  // Skip if they already have a successful upload recorded for THIS reporting
-  // week. ComplianceLog's Week Start column is written by doPost from the same
-  // getCurrentWeekStart_(), so comparing against it is exact.
-  var logSheet = ss.getSheetByName('ComplianceLog');
-  if (logSheet) {
-    var logData = getRecentLogRows_(logSheet, 3000);
-    for (var i = 0; i < logData.length; i++) {
-      var row = logData[i];
-      if (!row[0]) continue;
-      var rName = String(row[1] || '').trim().toLowerCase();
-      if (rName !== lower) continue;
-      if (String(row[3] || '').trim().toUpperCase() !== 'SUCCESS') continue;
-      var ws = row[2];
-      if (ws && typeof ws.getTime === 'function') {
-        ws = Utilities.formatDate(ws, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-      } else {
-        ws = String(ws || '').trim();
-      }
-      if (ws === weekStart) {
-        markWeeklyGenQueued_(name, weekStart);
-        return;
-      }
-    }
-  }
+  // NOTE — deliberately NOT scanning ComplianceLog here.
+  //
+  // The weekly change first shipped with getRecentLogRows_(logSheet, 3000) at
+  // this point, to answer "did they already upload this week?". That was a bad
+  // regression: ~24,000 cells read on the HEARTBEAT path, for every online
+  // agent, several times an hour. At ~22 concurrent agents it drove doGet
+  // latency up and contributed to Apps Script's "too many scripts running
+  // simultaneously" ceiling.
+  //
+  // The same question is now answered for free, event-driven: doPost stamps the
+  // weekly flag the moment it records a SUCCESS, so the cheap ScriptProperties
+  // check at the top of this function already covers it. Worst case, if a flag
+  // is somehow missing, one extra report is generated — harmless, and vastly
+  // preferable to a 24,000-cell read on the hot path.
 
   // Queue the trigger under lock (race-safe — same pattern as SmartRetry)
   var lock = LockService.getScriptLock();
@@ -2423,6 +2493,161 @@ function upsertRosterActivity_(name, status, version, nextPollAt, lastUpdateChec
   sheet.getRange(rowIdx, 3, 1, 7).setValues([vals]);
 }
 
+// -------------------- DRAIN MODE (incident brake) --------------------
+//
+// Why this exists (added 2026-07-31 after a self-sustaining outage):
+//
+// The agent keeps a replay queue of pings it failed to deliver, and retries them
+// on a timer. Pre-2.0.9 agents replay the ENTIRE queue every cycle and re-queue
+// anything that fails again. So a brief server hiccup makes the queue grow, which
+// raises the fleet's request rate, which keeps the server saturated — the account
+// pins at Google's 30-concurrent-execution ceiling and the admin dashboard can
+// never win a slot. It does not recover on its own.
+//
+// Fixing the agent is the real answer, but that requires a release reaching every
+// machine. Drain mode is the lever that works from the server alone, TODAY, on
+// agents already in the field:
+//
+//   Concurrent slots = arrival rate x duration  (Little's Law)
+//
+// We cannot lower the arrival rate of agents already built. We CAN collapse the
+// duration. Acknowledging a keep-alive costs ~30ms instead of ~300ms+, so the
+// same flood occupies ~10x fewer slots.
+//
+// Better still, it is self-terminating: the agent removes a ping from its queue
+// as soon as the server returns ok. So drain mode does not just absorb the
+// backlog — it makes the backlog disappear. Turn it on during an incident, leave
+// it until queues empty, then turn it off.
+//
+// What is given up while it is on: keep-alive pings are acknowledged without
+// updating "last seen", so live presence goes stale and developers may read as
+// Offline. Real events (SUCCESS / FAILURE / lifecycle) are NEVER dropped — they
+// are not noise statuses and take the normal path. No compliance data is lost.
+var DRAIN_MODE_PROP = 'drainMode';
+
+// -------------------- INGEST RATE INSTRUMENTATION --------------------
+// Added 2026-08-03. The account keeps hitting Google's 30-concurrent-execution
+// ceiling and every diagnosis so far has been inference from reading code. This
+// measures the one number that actually decides the question: how many requests
+// per minute is the fleet really sending?
+//
+//   ~26/min  -> baseline (22 agents polling 60s + heartbeat 5min). The fleet is
+//               innocent and something else is consuming the quota.
+//   hundreds -> a replay-queue flood, confirming the unbounded retry theory.
+//
+// Deliberately one cache get + one put, because this sits on the hottest path in
+// the system and must not become part of the problem it is measuring. Concurrent
+// increments can lose a count; that is fine — we need an order of magnitude, not
+// an audit. Buckets expire themselves after 15 minutes.
+function countIngest_(kind) {
+  try {
+    var c = CacheService.getScriptCache();
+    var k = 'ingest_' + Math.floor(Date.now() / 60000) + '_' + kind;
+    var cur = c.get(k);
+    c.put(k, String((cur ? parseInt(cur, 10) : 0) + 1), 900);
+  } catch (e) { /* never let measurement break ingestion */ }
+}
+
+// Run this from the editor after the system has been live a few minutes.
+function logIngestRate() {
+  requireAdmin_();
+  var c = CacheService.getScriptCache();
+  var nowMin = Math.floor(Date.now() / 60000);
+  var kinds = ['post', 'poll', 'noise', 'real', 'drained', 'throttled'];
+  var rows = [];
+  var totals = {};
+  kinds.forEach(function(k) { totals[k] = 0; });
+
+  for (var back = 14; back >= 0; back--) {
+    var min = nowMin - back;
+    var row = { minutesAgo: back };
+    var any = false;
+    kinds.forEach(function(kind) {
+      var v = c.get('ingest_' + min + '_' + kind);
+      var n = v ? parseInt(v, 10) : 0;
+      row[kind] = n;
+      totals[kind] += n;
+      if (n) any = true;
+    });
+    if (any || back < 3) rows.push(row);
+  }
+
+  var mins = 15;
+  var verdict;
+  var postPerMin = totals.post / mins;
+  if (totals.post === 0) {
+    verdict = 'NO DATA YET — either nothing has arrived, or this build was only just deployed. Wait 3 minutes and run again.';
+  } else if (postPerMin < 60) {
+    verdict = 'BASELINE (' + postPerMin.toFixed(1) + ' POST/min). Expected is ~26/min for 22 agents. ' +
+              'The fleet is NOT flooding — the concurrency ceiling is being consumed by something else. ' +
+              'Check the Executions page for long-running functions.';
+  } else if (postPerMin < 200) {
+    verdict = 'ELEVATED (' + postPerMin.toFixed(1) + ' POST/min, ~' + (postPerMin / 26).toFixed(1) + 'x baseline). ' +
+              'Consistent with agents replaying backlogged pings. Enable drain mode to let the queues empty.';
+  } else {
+    verdict = 'FLOOD CONFIRMED (' + postPerMin.toFixed(1) + ' POST/min, ~' + (postPerMin / 26).toFixed(1) + 'x baseline). ' +
+              'This is the replay-queue ratchet. Enable drain mode now (logEnableDrainMode) and ship the v2.0.9 agent.';
+  }
+
+  return {
+    windowMinutes: mins,
+    totals: totals,
+    perMinute: {
+      post:  +(totals.post / mins).toFixed(1),
+      poll:  +(totals.poll / mins).toFixed(1),
+      noise: +(totals.noise / mins).toFixed(1),
+      real:  +(totals.real / mins).toFixed(1)
+    },
+    drainModeOn: isDrainMode_(),
+    byMinute: rows,
+    baselineExpected: '~26 POST/min and ~22 poll/min for 22 agents',
+    verdict: verdict
+  };
+}
+
+function logIngestRateReport() { Logger.log(JSON.stringify(logIngestRate(), null, 2)); }
+
+function isDrainMode_() {
+  try {
+    var c = CacheService.getScriptCache();
+    var v = c.get('drainModeFlag');
+    if (v !== null) return v === '1';
+    var on = PropertiesService.getScriptProperties().getProperty(DRAIN_MODE_PROP) === '1';
+    try { c.put('drainModeFlag', on ? '1' : '0', 60); } catch (e) {}
+    return on;
+  } catch (e) {
+    return false; // fail-open: never let this check itself break ingestion
+  }
+}
+
+function postOk_(extra) {
+  var out = { result: 'ok' };
+  if (extra) Object.keys(extra).forEach(function(k) { out[k] = extra[k]; });
+  return ContentService.createTextOutput(JSON.stringify(out))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function adminSetDrainMode(on) {
+  requireAdmin_();
+  var props = PropertiesService.getScriptProperties();
+  if (on) props.setProperty(DRAIN_MODE_PROP, '1');
+  else props.deleteProperty(DRAIN_MODE_PROP);
+  // Clear the 60s cache so the change takes effect immediately, not in a minute.
+  try { CacheService.getScriptCache().remove('drainModeFlag'); } catch (e) {}
+  log_('DrainMode: ' + (on ? 'ENABLED — keep-alive pings acknowledged without writes' : 'disabled — normal ingestion resumed'));
+  return {
+    success: true,
+    drainMode: !!on,
+    note: on
+      ? 'Keep-alive pings are now acked instantly. Agent replay queues will drain. Live presence will read stale until you disable it.'
+      : 'Normal ingestion resumed. Presence recovers within ~2 minutes.'
+  };
+}
+
+function logEnableDrainMode()  { Logger.log(JSON.stringify(adminSetDrainMode(true),  null, 2)); }
+function logDisableDrainMode() { Logger.log(JSON.stringify(adminSetDrainMode(false), null, 2)); }
+function logDrainModeStatus()  { Logger.log(JSON.stringify({ drainMode: isDrainMode_() }, null, 2)); }
+
 function doPost(e) {
   var sigErr = verifyWebhookSignature_(e);
   if (sigErr) {
@@ -2453,9 +2678,19 @@ function doPost(e) {
     var version         = payload.version         || '';
     var lastUpdateCheck = payload.lastUpdateCheck || '';
 
-    var ss    = SpreadsheetApp.getActiveSpreadsheet();
-
     var isNoise = NOISE_STATUSES.indexOf(status) !== -1;
+
+    countIngest_('post');
+    countIngest_(isNoise ? 'noise' : 'real');
+
+    // DRAIN MODE — the emergency brake. See isDrainMode_ for the full rationale.
+    // Acknowledges keep-alive pings instantly, touching nothing. Because the
+    // agent deletes a queued ping once the server returns ok, this actively
+    // DRAINS a replay backlog instead of merely surviving it.
+    if (isNoise && isDrainMode_()) {
+      countIngest_('drained');
+      return postOk_({ drained: true });
+    }
 
     // v3: noise pings (heartbeats, pause/idle pings, pongs) no longer append
     // log rows. They update the developer's RegisteredDevelopers row in-place,
@@ -2474,12 +2709,33 @@ function doPost(e) {
           cache.put(throttleKey, 'true', 60);
         }
       }
-      if (!throttleActive) {
-        upsertRosterActivity_(name, status, version, nextPollAt, lastUpdateCheck);
+      // Return NOW for a throttled keep-alive (added 2026-07-31).
+      //
+      // A repeat heartbeat inside the 60s window carries no new information, and
+      // this is the single hottest path in the system. Returning here means such
+      // a request never calls SpreadsheetApp.getActiveSpreadsheet() — which was
+      // previously executed unconditionally, on every ping, before anyone knew
+      // whether the ping mattered.
+      //
+      // This matters because concurrent slot usage is arrival-rate x duration
+      // (Little's Law). Opening the spreadsheet costs a few hundred ms; this
+      // path costs a few tens. Cutting duration ~10x cuts concurrent slots ~10x
+      // at the same request rate, which is what stops a replay burst from
+      // exhausting the account's 30-execution ceiling.
+      //
+      // Smart Retry is unaffected: it has its own 180s cooldown, so it could
+      // never have fired on a heartbeat throttled at 60s anyway.
+      if (throttleActive) {
+        countIngest_('throttled');
+        return postOk_({ throttled: true });
       }
+
+      upsertRosterActivity_(name, status, version, nextPollAt, lastUpdateCheck);
     }
 
     if (!isNoise) {
+      // Opened lazily — only real lifecycle events need the spreadsheet.
+      var ss = SpreadsheetApp.getActiveSpreadsheet();
       // Lifecycle + terminal events still append to ComplianceLog — the Queue
       // page (in-progress detection), progress rows, Smart Retry, compliance
       // grid and CSV export all derive from these rows.
@@ -2491,6 +2747,15 @@ function doPost(e) {
       }
       var weekStart = getCurrentWeekStart_();
       sheet.appendRow([new Date(), name, weekStart, status, message, nextPollAt, version, lastUpdateCheck]);
+      // Event-driven weekly guard: the moment a real upload lands, record that
+      // this person is done for the week. This replaces what used to be a
+      // 3000-row ComplianceLog scan on the heartbeat path, and is both cheaper
+      // and more accurate — it is written by the very event it is tracking.
+      // Scoped to SUCCESS only, so a FAILURE still leaves them eligible for a
+      // retry rather than being marked complete.
+      if (status === STATUS.SUCCESS && name && name !== 'UNKNOWN') {
+        try { markWeeklyGenQueued_(name, weekStart); } catch (e) {}
+      }
       bumpLastModified_();
     } else {
       // Noise events do not update lastModified, avoiding frequent background client-side auto-refreshes.
@@ -5572,7 +5837,7 @@ function uninstallWeeklyDigestTrigger() {
 // setupUtilityDistribution until the Gist says 2.0.6, or the dashboard will flag
 // the whole fleet as outdated and the mass-reminder will email 76 people a
 // download link that 404s. Run it as the LAST step of the release.
-var SETUP_LATEST_VERSION = '2.0.7';
+var SETUP_LATEST_VERSION = '2.0.9';
 
 // FIRST-INSTALL download links. Must be https://.
 //

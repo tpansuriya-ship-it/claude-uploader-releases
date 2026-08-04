@@ -42,3 +42,11 @@ dist/
 **/dist/
 vendor/
 **/vendor/
+
+# Personnel exports - NEVER commit these. This remote is PUBLIC, and the Claude seat
+# export contains 85 employees' names and work email addresses.
+members-*.csv
+roster-*.csv
+*seat*.csv
+DEPLOY-VALUES.txt
+SQL-CONNECTION.txt

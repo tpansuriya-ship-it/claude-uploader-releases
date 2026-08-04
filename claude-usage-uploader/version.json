@@ -1,33 +1,33 @@
 {
-  "latestVersion": "2.0.7",
+  "latestVersion": "2.0.8",
   "platforms": {
     "win32": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-win-x64.exe",
-      "checksum": "20fd1a35ccaccb002c19792b321d0df8e5b1788e0929314a1790caa3ce6959e2"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-win-x64.exe",
+      "checksum": "68aa582b10664887c8f941cc6f7c265004299159b5312d705dd5bda4b1b75c5d"
     },
     "win32-x64": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-win-x64.exe",
-      "checksum": "20fd1a35ccaccb002c19792b321d0df8e5b1788e0929314a1790caa3ce6959e2"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-win-x64.exe",
+      "checksum": "68aa582b10664887c8f941cc6f7c265004299159b5312d705dd5bda4b1b75c5d"
     },
     "darwin": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-macos-arm64",
-      "checksum": "d5aa1709244aa78d072283b677b6cf8fde12b0eb6e69b21fb1b99f37dc816595"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-macos-arm64",
+      "checksum": "62d625ac58a0a901521548d7c93c966554d3c2edfa8a4cdbb32f9ebce11e7b1a"
     },
     "darwin-arm64": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-macos-arm64",
-      "checksum": "d5aa1709244aa78d072283b677b6cf8fde12b0eb6e69b21fb1b99f37dc816595"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-macos-arm64",
+      "checksum": "62d625ac58a0a901521548d7c93c966554d3c2edfa8a4cdbb32f9ebce11e7b1a"
     },
     "darwin-x64": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-macos-x64",
-      "checksum": "c2eef673975509dfe32c496b560ca6be3dc408772ea40992253063bc5d72d225"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-macos-x64",
+      "checksum": "b2e7fcaa4b41db860ee077d2e7d071e51ba03e54cd0aba329c048a33ea3944bc"
     },
     "linux": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-linux-x64",
-      "checksum": "36ebeece635560ce0b92ac7cdac92c57a616f90991081548fd40251c6202a101"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-linux-x64",
+      "checksum": "22f36e6eadd1ce2bafccc91ca99f99c04a903e324679a092a5366dc27ff64eef"
     },
     "linux-x64": {
-      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.7/ClaudeUsageUploader_v2.0.7-linux-x64",
-      "checksum": "36ebeece635560ce0b92ac7cdac92c57a616f90991081548fd40251c6202a101"
+      "downloadUrl": "https://github.com/tpansuriya-ship-it/claude-uploader-releases/releases/download/v2.0.8/ClaudeUsageUploader_v2.0.8-linux-x64",
+      "checksum": "22f36e6eadd1ce2bafccc91ca99f99c04a903e324679a092a5366dc27ff64eef"
     }
   }
 }

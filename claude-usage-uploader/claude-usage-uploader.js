@@ -38,7 +38,7 @@ const IS_LINUX = process.platform === 'linux';
 const PLATFORM_KEY = IS_WIN ? 'win32' : IS_MAC ? 'darwin' : 'linux';
 
 // -------------------- CONFIGURATION --------------------
-const VERSION = '2.0.8';
+const VERSION = '2.0.9';
 const FORCE_RUN = process.argv.includes('--force');
 const IS_SCHEDULED = process.argv.includes('--scheduled');
 const UPDATED_FROM = (() => {
@@ -136,7 +136,46 @@ function revertDriveFolderToDefault(reason) {
 let globalCcusageJsPath = '';
 let globalCcusageBinPath = '';
 const SERVICE_KEY_FILE = 'service-account-key.json';
-const WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycby9bFBRwYLu1GF6urQn3saAuVacI95NjS2Jt2G3eiba3StKwu9i8POjXnlx224NMMXt/exec';
+// -------------------- REPORTING ENDPOINT --------------------
+//
+// v2.0.9: reporting moved off Google Apps Script to a .NET service.
+//
+// WHY: Apps Script enforces a hard ceiling of ~30 simultaneous executions PER GOOGLE
+// ACCOUNT. It cannot be raised and there is no paid tier. With 22 machines reporting
+// continuously (77 registered) that ceiling was reached repeatedly and the admin
+// dashboard became unusable, with no metrics available to diagnose it.
+//
+// The wire protocol is UNCHANGED - same HMAC signing, same query parameters, same
+// payload, same checkTrigger response - so this is only a change of host.
+//
+// Report files still upload straight to Google Drive via the service account. That path
+// never involved Apps Script and is unaffected.
+const DEFAULT_WEBHOOK_URL = 'https://claudeusage.sigmasolve.com/exec';
+
+// The previous Apps Script endpoint, kept for reference and for a fast rollback.
+const LEGACY_WEBHOOK_URL  = 'https://script.google.com/macros/s/AKfycby9bFBRwYLu1GF6urQn3saAuVacI95NjS2Jt2G3eiba3StKwu9i8POjXnlx224NMMXt/exec';
+
+// Resolved at startup, and overridable per machine via "webhookUrl" in config.json.
+//
+// That override matters: without it, rolling one machine back means building and shipping
+// a whole new release. With it, rollback is editing one line of JSON on that machine -
+// which is what you want at 2am when a cutover has gone wrong on a single laptop.
+let WEBHOOK_URL = DEFAULT_WEBHOOK_URL;
+
+function resolveWebhookUrl() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    const override = String(cfg && cfg.webhookUrl ? cfg.webhookUrl : '').trim();
+    // https only: the agent uses the https module exclusively, so an http:// value here
+    // would fail on every request in a way that looks like the server is down.
+    if (/^https:\/\/\S+$/i.test(override)) {
+      WEBHOOK_URL = override;
+      return { url: override, source: 'config.json override' };
+    }
+  } catch { /* no config yet, or unreadable - the default is correct */ }
+  WEBHOOK_URL = DEFAULT_WEBHOOK_URL;
+  return { url: DEFAULT_WEBHOOK_URL, source: 'compiled default' };
+}
 
 // When packaged with pkg, process.execPath is the binary; otherwise use __dirname
 const EXE_DIR = process.pkg ? path.dirname(process.execPath) : __dirname;
@@ -157,6 +196,28 @@ const PING_TIMEOUT_MS    = 10000;
 const PING_MAX_ATTEMPTS  = 3;
 const EVENTS_ROTATE_BYTES      = 5 * 1024 * 1024;   // 5 MB
 const FAILED_PINGS_WARN_BYTES  = 10 * 1024 * 1024;  // 10 MB
+
+// -------------------- REPLAY QUEUE BOUNDS --------------------
+// Added 2026-07-31 after a production outage that would not self-heal.
+//
+// The replay queue was unbounded: every failed ping was appended forever, and
+// every 5 minutes the agent replayed the ENTIRE file, one request per entry,
+// pushing any still-failing entry straight back. That turns a brief server
+// hiccup into a permanent outage:
+//
+//   server busy -> pings fail -> queue grows -> next cycle sends MORE requests
+//   -> server busier -> nothing ever drains
+//
+// With 22 machines the fleet's request rate becomes 22 x queueLength / 300s,
+// which climbs without limit while the server is down and then all fires at
+// once the moment it comes back. Google's per-account ceiling is 30 concurrent
+// executions, so the fleet re-saturates the account on contact and the admin
+// dashboard can never win a slot.
+//
+// Three independent bounds, because any one alone is insufficient:
+const FAILED_PINGS_MAX_ENTRIES  = 200;               // hard cap; oldest dropped
+const FAILED_PINGS_MAX_AGE_MS   = 24 * 60 * 60 * 1000; // stale pings are worthless
+const FAILED_PINGS_REPLAY_BATCH = 20;                // per cycle, so rate is CONSTANT
 
 let lastUpdateCheckAt = null;
 
@@ -182,6 +243,19 @@ function enqueueFailedPing({ payload, firstAttemptAt, lastAttemptAt }) {
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const line = JSON.stringify({ id, payload, firstAttemptAt, lastAttemptAt }) + '\n';
     fs.appendFileSync(FAILED_PINGS_FILE, line);
+    // Enforce the hard cap here rather than at replay time, so the file cannot
+    // grow without limit even if the agent never gets a chance to replay.
+    // Oldest entries go first: a 3-day-old HEARTBEAT has no value, whereas a
+    // recent SUCCESS still needs to reach the server.
+    try {
+      const all = loadFailedPings();
+      if (all.length > FAILED_PINGS_MAX_ENTRIES) {
+        const kept = all.slice(-FAILED_PINGS_MAX_ENTRIES);
+        rewriteFailedPings(kept);
+        log(`failed-pings queue capped: dropped ${all.length - kept.length} oldest entr` +
+            `${all.length - kept.length === 1 ? 'y' : 'ies'} (limit ${FAILED_PINGS_MAX_ENTRIES})`);
+      }
+    } catch {}
     try {
       const stat = fs.statSync(FAILED_PINGS_FILE);
       if (stat.size > FAILED_PINGS_WARN_BYTES) log('WARNING: failed-pings.ndjson exceeds 10 MB — check GAS connectivity');
@@ -2076,8 +2150,14 @@ async function serviceLoop(cfg) {
     applyServerDriveFolderId(cfg.driveFolderId, false); // already persisted
   }
 
+  // Resolve the endpoint before anything is sent, and log it. Which server this agent
+  // reports to is the single most useful fact when diagnosing "why is this machine not
+  // appearing on the dashboard", and previously it was invisible.
+  const endpoint = resolveWebhookUrl();
+
   log(`Service loop started v${VERSION} — polling every ${POLL_INTERVAL_MS / 1000}s ` +
       `(pid=${process.pid}, driveFolder=${getDriveFolderId()})`);
+  log(`Reporting to ${endpoint.url} (${endpoint.source})`);
   writeLocalHealth();
 
   // Independent local liveness signal consumed by the Windows health task.
@@ -2291,12 +2371,40 @@ async function serviceLoop(cfg) {
     }
   }, UPDATE_CHECK_MS);
 
-  // --- Replay failed pings every 5 minutes ---
+  // --- Replay failed pings every 5 minutes (rate-bounded — see the constants) ---
+  //
+  // The critical property: this sends AT MOST FAILED_PINGS_REPLAY_BATCH requests
+  // per cycle regardless of how many are queued. A backlog now takes longer to
+  // drain instead of hitting the server harder, so a large queue can no longer
+  // amplify an outage or re-saturate the account when the server returns.
+  //
+  // The interval is jittered per process so 22 machines that all rebooted
+  // together do not converge on the same 5-minute boundary forever.
+  const replayIntervalMs = 5 * 60 * 1000 + Math.floor(Math.random() * 60 * 1000);
   setInterval(async () => {
-    const queue = loadFailedPings();
-    if (queue.length === 0) return;
+    const all = loadFailedPings();
+    if (all.length === 0) return;
+
+    // Drop entries too old to be worth reporting. Without this, a machine that
+    // was offline for a week would wake up and replay a week of dead heartbeats.
+    const now = Date.now();
+    const fresh = [];
+    let expired = 0;
+    for (const item of all) {
+      const t = Date.parse(item.firstAttemptAt || item.lastAttemptAt || '') || 0;
+      if (t && (now - t) > FAILED_PINGS_MAX_AGE_MS) expired++;
+      else fresh.push(item);
+    }
+    if (expired) log(`Ping replay: discarded ${expired} entr${expired === 1 ? 'y' : 'ies'} older than 24h`);
+
+    const batch    = fresh.slice(0, FAILED_PINGS_REPLAY_BATCH);
+    const deferred = fresh.slice(FAILED_PINGS_REPLAY_BATCH);
+    if (deferred.length) {
+      log(`Ping replay: sending ${batch.length} of ${fresh.length} queued (${deferred.length} deferred to next cycle)`);
+    }
+
     const remaining = [];
-    for (const item of queue) {
+    for (const item of batch) {
       try {
         const r = await sendPingOnce(item.payload);  // one shot per cycle, not full retry
         if (r.ok) {
@@ -2304,11 +2412,22 @@ async function serviceLoop(cfg) {
           log(`Ping replay succeeded: ${item.payload.name} ${item.payload.status}`);
         } else {
           remaining.push(item);
+          // The server is still refusing. Stop hammering it for the rest of this
+          // cycle — the remaining batch would almost certainly fail too, and
+          // those attempts are exactly what kept the account saturated.
+          if (/too many scripts|<html/i.test(String(r.body || ''))) {
+            const idx = batch.indexOf(item);
+            batch.slice(idx + 1).forEach(rest => remaining.push(rest));
+            log('Ping replay: server is refusing requests — backing off until next cycle');
+            break;
+          }
         }
       } catch { remaining.push(item); }
     }
-    if (remaining.length !== queue.length) rewriteFailedPings(remaining);
-  }, 5 * 60 * 1000);
+
+    const next = remaining.concat(deferred);
+    if (next.length !== all.length) rewriteFailedPings(next);
+  }, replayIntervalMs);
 
   // Keep the Node.js event loop alive indefinitely
   process.stdin.resume();

@@ -197,15 +197,30 @@ function requestDatedReport() {
     .adminQueueDatedReport(name, from.value, to.value);
 }
 
-function loadOnDemandReports() {
+// "There are too many scripts running simultaneously" is Apps Script's
+// account-wide concurrency ceiling, not a fault in the request — with ~20 agents
+// polling plus the dashboard's own refreshes it is hit occasionally and clears
+// within seconds. Retry once quietly instead of showing the admin a red box for
+// something that fixes itself.
+function rsIsTransient(msg) {
+  return /too many scripts|try again later|internal error|timed? ?out|Service Spreadsheets|unavailable/i.test(msg);
+}
+
+function loadOnDemandReports(isRetry) {
   var box = document.getElementById('onDemandList');
   if (!box) return;
   box.innerHTML = '<div class="empty-state">Checking for finished reports…</div>';
   google.script.run
     .withSuccessHandler(renderOnDemandReports)
     .withFailureHandler(function(err) {
+      var m = String((err && err.message) || err);
+      if (!isRetry && rsIsTransient(m)) {
+        box.innerHTML = '<div class="empty-state">Google was busy — retrying…</div>';
+        setTimeout(function() { loadOnDemandReports(true); }, 4000);
+        return;
+      }
       box.innerHTML = '<div class="empty-state" style="color:var(--red)">Could not load: ' +
-                      rsEsc(String((err && err.message) || err)) + '</div>';
+                      rsEsc(m) + '</div>';
     })
     .listOnDemandReports();
 }
@@ -219,9 +234,18 @@ function renderOnDemandReports(res) {
                     rsEsc((res && res.error) || 'No response') + '</div>';
     return;
   }
+  // A failed sync means "there might be a newer report not shown yet", not
+  // "the list is broken" — so it is a note above real data, never a red box
+  // replacing it.
+  var warn = res.syncWarning
+    ? '<div class="empty-state" style="color:var(--amber);padding:10px 0">' +
+      'Could not check for brand-new reports just now (' + rsEsc(String(res.syncWarning)) +
+      '). Anything already collected is listed below — press Refresh in a moment.</div>'
+    : '';
+
   var list = res.reports || [];
   if (list.length === 0) {
-    box.innerHTML = '<div class="empty-state">No on-demand reports yet. ' +
+    box.innerHTML = warn + '<div class="empty-state">No on-demand reports yet. ' +
       'Request one above — it appears here once that machine uploads it.</div>';
     return;
   }
@@ -243,7 +267,7 @@ function renderOnDemandReports(res) {
   var rows = Object.keys(groups).map(function(k) { return groups[k]; })
     .sort(function(a, b) { return b.generatedIso.localeCompare(a.generatedIso); });
 
-  var html = '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+  var html = warn + '<div class="table-wrap"><table class="data-table"><thead><tr>' +
     '<th>Developer</th><th>Period</th><th>Generated</th><th>Result</th><th>Download</th>' +
     '</tr></thead><tbody>';
 
@@ -2155,26 +2179,20 @@ document.addEventListener('click', function(e) {
       retention + ' days, then purge automatically. You can restore them at any point before that.</span>',
       'Remove user',
       function() {
-        google.script.run
-          .withSuccessHandler(function(r) {
-            if (r.success) {
-              showToast(name + ' removed — reports retained for ' + (r.retentionDays || retention) + ' days');
-              fetchData();
-            } else showToast('Error: ' + (r.error || 'Unknown'), true);
-          })
-          .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
-          .removeRegisteredDeveloper(name);
+        adminMutate('removeRegisteredDeveloper', [name], 'Remove ' + name, function(r) {
+          if (r && r.success) {
+            showToast(name + ' removed — reports retained for ' + (r.retentionDays || retention) + ' days');
+            fetchData();
+          } else showToast('Error: ' + ((r && r.error) || 'Unknown'), true);
+        });
       }
     );
   } else if (btn.classList.contains('js-restore-user')) {
     e.stopPropagation();
-    google.script.run
-      .withSuccessHandler(function(r) {
-        if (r.success) { showToast(name + ' restored'); fetchData(); }
-        else showToast('Error: ' + (r.error || 'Unknown'), true);
-      })
-      .withFailureHandler(function(err) { showToast('Failed: ' + err.message, true); })
-      .adminRestoreUser(name);
+    adminMutate('adminRestoreUser', [name], 'Restore ' + name, function(r) {
+      if (r && r.success) { showToast(name + ' restored'); fetchData(); }
+      else showToast('Error: ' + ((r && r.error) || 'Unknown'), true);
+    });
   } else if (btn.classList.contains('js-purge-user')) {
     e.stopPropagation();
     showConfirm(
@@ -2833,6 +2851,33 @@ function forceHotPatch(btn, name, isRetry) {
       }
     })
     .forceSendUpdateTrigger(name);
+}
+
+// Shared wrapper for roster mutations (remove / restore / purge).
+//
+// All of these acquire the one global script lock, and they acquire it BEFORE
+// writing anything. So a "Lock timeout" exception means the write never
+// happened — nothing was half-applied — and a single silent retry is safe.
+// Without this the admin sees a bare "Failed: Exception: Lock timeout: another
+// process was holding the lock for too long", which reads like the user record
+// is broken when in fact the fleet was just briefly busy.
+function adminMutate(fnName, args, label, onDone) {
+  function attempt(isRetry) {
+    var runner = google.script.run
+      .withSuccessHandler(function(r) { onDone(r); })
+      .withFailureHandler(function(err) {
+        var m = String((err && err.message) || err);
+        if (!isRetry && /lock timeout|too many scripts|try again later/i.test(m)) {
+          showToast(label + ': server busy — retrying once…', false);
+          setTimeout(function() { attempt(true); }, 2500);
+          return;
+        }
+        showToast('Failed: ' + m +
+          (isRetry ? ' (after 1 retry — the fleet is busy, try again shortly)' : ''), true);
+      });
+    runner[fnName].apply(runner, args);
+  }
+  attempt(false);
 }
 
 // Theme Switcher Logic
